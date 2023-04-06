@@ -1,0 +1,4 @@
+configargparse
+trimesh>=3.8
+open3d>=0.12
+tensorboard==2.4
