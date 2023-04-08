@@ -5,11 +5,11 @@ SkiRT implementation
 
 ##### 04/07
 
-复现一个很简单的coarse stage网络。
+Wrote a simple coarse-stage network (according to the SkiRT paper section 4.1)
 
-- 暂时还是使用body vertices作为输入，虽然分布不均匀但是这样训练会比较快
-- 8层MLP，输入：point position (dim=3) + global geometric feature (dim=256), 不知道给每个点使用local feature会不会效果比较好
-- 每个类型的服装分别train一个network，合在一起应该也能work
+- Using the vertices of the SMPL-X model as input. Note that the point distribution in this case is not consistent across the body.
+- 8 layers of MLP. Input: point position (dim=3) + global geometric feature (dim=256). Using local geometric feature for every point may potentially improve the result.
+- Train a separate network for every garment. It should also work when all the garments are trained together using only one network.
 
 **Parameters**
 
@@ -28,10 +28,12 @@ epoch: 250
 
 **Problems**
 
-用vertices当输入，点云太稀疏了，sample points然后做插值也是可以的，但是太慢，而且似乎还有一些诡异的bug？想不出好的加速方法。
+The point cloud is too sparse using the vertices as input (and the density of point cloud is not consistent). Better approach: `sample_point_uniformly`. 
+
+We can sample arbitrarily dense point cloud from the SMPL-X mesh, and perform interpolation to get the LBS weights of the sampled points. The problem is that this greatly slows down the training. 
 
 **Next**
 
-- 写Fine stage阶段的网络
+- Find stage network
 - sparse point cloud -> dense point cloud: How?
 - LBS weight field: is it really necessary?
