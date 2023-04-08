@@ -7,9 +7,9 @@ SkiRT implementation
 
 Wrote a simple coarse-stage network (according to the SkiRT paper section 4.1)
 
-- Using the vertices of the SMPL-X model as input. Note that the point distribution in this case is not consistent across the body.
-- 8 layers of MLP. Input: point position (dim=3) + global geometric feature (dim=256). Using local geometric feature for every point may potentially improve the result.
-- Train a separate network for every garment. It should also work when all the garments are trained together using only one network.
+- Used the vertices of the SMPL-X model as input. Note that the point distribution in this case is not consistent across the body.
+- Used 8 layers of MLP. Input: point position (dim=3) + global geometric feature (dim=256). Using local geometric feature for every point may potentially improve the result.
+- Trained a separate network for every garment. It should also work when all the garments are trained together using only one network.
 
 **Parameters**
 
@@ -34,7 +34,7 @@ We can sample arbitrarily dense point cloud from the SMPL-X mesh, and perform in
 
 **Next**
 
-- Find stage network
+- fine stage network
 - sparse point cloud -> dense point cloud: How?
 - LBS weight field: is it really necessary?
 
