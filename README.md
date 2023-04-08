@@ -21,7 +21,7 @@ num_samples: 10475 (SMPL-X number of vertices)
 epoch: 250
 ```
 
-**Coarse stage: Results**
+**Coarse stage: Temp results**
 
 ![image](./vis/pcl_anna.gif)
 ![image](./vis/pcl_felice.gif)
@@ -37,3 +37,5 @@ We can sample arbitrarily dense point cloud from the SMPL-X mesh, and perform in
 - Find stage network
 - sparse point cloud -> dense point cloud: How?
 - LBS weight field: is it really necessary?
+
+https://github.com/xinyu-evolutruster/SkiRT
