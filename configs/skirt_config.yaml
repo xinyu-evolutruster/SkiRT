@@ -1,0 +1,9 @@
+name: SkiRT_coarse
+dataset_type: resynth
+mode: 'train'
+
+batch_size: 8
+lr: 5e-5
+lr_geomfeat: 1e-4
+
+epochs: 250

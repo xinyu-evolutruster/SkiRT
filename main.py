@@ -15,13 +15,15 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
+import open3d as o3d
 
 from lib.config_parser import parse_config, parse_outfits
-from lib.dataset import CloDataSet
-from lib.network import POP
-from lib.train import train
+from lib.dataset import CloDataSet, SKiRTCoarseDataset
+from lib.network import POP, SkiRTCoarseNetwork
+from lib.train import train, train_coarse
 from lib.infer import test_seen_clo, test_unseen_clo
 from lib.utils_io import load_masks, load_barycentric_coords, save_model, save_latent_feats, load_latent_feats
+from lib.utils_io import customized_export_ply, vertex_normal_2_vertex_color
 from lib.utils_model import SampleSquarePoints
 from lib.utils_train import adjust_loss_weights
 
@@ -29,6 +31,7 @@ torch.manual_seed(12345)
 np.random.seed(12345)
 
 DEVICE = torch.device('cuda')
+
 
 def main():
     args = parse_config()
@@ -337,5 +340,107 @@ def main():
             test_rst_msg.append('\t\t{}'.format(test_unseen_result))
 
 
+def main_SkiRT():
+    args = parse_config()
+    
+    exp_name = args.name
+    
+    # NOTE: when using your custom data, modify the following path to where the packed data is stored.
+    data_root = join(PROJECT_DIR, 'data', '{}'.format(args.dataset_type.lower()), 'packed')
+
+    log_dir = join(PROJECT_DIR,'tb_logs/{}/{}'.format(date.today().strftime('%m%d'), exp_name))
+    ckpt_dir = join(LOGS_PATH, exp_name)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    body_model = 'smpl' if args.dataset_type.lower() == 'cape' else 'smplx'
+
+    # build_model
+    model = SkiRTCoarseNetwork(
+        input_nc=3,    # num channels of the input point
+        input_sc=256,  # num channels of the shape code
+        num_layers=5,   # num of the MLP layers
+        num_layers_loc=3, # num of the MLP layers for the location prediction
+        num_layers_norm=3, # num of the MLP layers for the normal prediction
+        hsize=256,     # hidden layer size of the MLP
+        skip_layer=[4],  # skip layers
+        actv_fn='softplus',  # activation function
+        pos_encoding=False  
+    )
+    model = model.cuda()
+    # model = model.double().cuda()
+    print(model)
+    
+    # geometric feature tensor
+    geom_featmap = torch.ones(1, 256).normal_(mean=0., std=0.01).cuda()
+    geom_featmap.requires_grad = True
+    
+    # geometric feature tensor: local feature for every point
+    geom_featmap = torch.ones(10475, 256).normal_(mean=0., std=0.01).cuda()
+    geom_featmap.requires_grad = True
+    
+    optimizer = torch.optim.Adam(
+        [
+            {"params": model.parameters(), "lr": args.lr},
+            {"params": geom_featmap, "lr": args.lr_geomfeat}
+        ])
+        
+    if args.mode.lower() in ['train', 'resume']:
+
+        train_set = SKiRTCoarseDataset(
+            dataset_type='resynth',
+            data_root=data_root, 
+            dataset_subset_portion=1.0,
+            sample_spacing = 1,
+            outfits={'rp_felice_posed_004'},
+            smpl_face_path='./assets/smplx_faces.npy',
+            smpl_model_path='./assets/smplx/SMPLX_NEUTRAL.pkl',
+            split='train', 
+            num_samples=20000,
+            knn=3,
+            body_model='smplx'
+        )
+
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2)
+        
+        print("Total: {} training examples. Training started..".format(len(train_set)))
+
+        n_epochs = args.epochs
+        epoch_now = 0
+
+        model.to(DEVICE)
+        start = time.time()
+        pbar = range(epoch_now, n_epochs)
+
+        for epoch_idx in pbar:
+            wdecay_rgl = adjust_loss_weights(args.w_rgl, epoch_idx, mode='decay', start=args.decay_start, every=args.decay_every)
+            wrise_normal = adjust_loss_weights(args.w_normal, epoch_idx,  mode='rise', start=args.rise_start, every=args.rise_every)
+            loss_weights = torch.tensor([args.w_s2m, args.w_m2s, wrise_normal, wdecay_rgl, args.w_latent_rgl])
+
+            train_stats = train_coarse(
+                model, train_loader, optimizer, shape_featmap=geom_featmap,
+            )
+            
+            full_pred = train_stats[0]
+            # body_verts = train_stats[1]
+            normals = train_stats[2]
+            # pcd = o3d.geometry.PointCloud(
+            #     o3d.utility.Vector3dVector(full_pred[0].cpu().detach().numpy()),
+            #     o3d.utility.Vector3dVector(normals[0].cpu().detach().numpy())
+            # )
+            # o3d.io.write_point_cloud('./results/pred_pcd_{}.ply'.format(epoch_idx), pcd)
+            if epoch_idx % 10 == 0:
+                customized_export_ply(
+                    './results/pred_pcd_{}.ply'.format(epoch_idx),
+                    v=full_pred[0].cpu().detach().numpy(),
+                    v_n=normals[0].cpu().detach().numpy(), 
+                    v_c=vertex_normal_2_vertex_color(normals[0].cpu().detach().numpy()),                          
+                )
+
+        end = time.time()
+        t_total = (end - start) / 60
+        print("Training finished, duration: {:.2f} minutes. Now eval on test set..\n".format(t_total))
+
+
 if __name__ == '__main__':
-    main()
+    # main()
+    main_SkiRT()

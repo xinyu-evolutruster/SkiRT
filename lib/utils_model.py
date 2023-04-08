@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import open3d as o3d
+
 def gen_transf_mtx_full_uv(verts, faces):
     '''
     given a positional uv map, for each of its pixel, get the matrix that transforms the prediction from local to global coordinates
@@ -58,6 +60,49 @@ def gen_transf_mtx_from_vtransf(vtransf, bary_coords, faces, scaling=1.0):
     transf_mtx_uv_pts = torch.einsum('bpqijk,pqi->bpqjk', vtransf_by_tris, bary_coords) # [batch, uvsize, uvsize, 3, 3], last 2 dims are the rotation matix
     transf_mtx_uv_pts *= scaling
     return transf_mtx_uv_pts
+
+
+def get_transf_mtx_from_vtransf(vtransf, body_verts, bary_coords, indices):
+    """
+    Input:
+        vtransf: [batch, 10475, 3, 3] # per-vertex rotation matrix
+        body_verts: [batch, 10475, 3] # body verts
+        indices: [batch, 20000, 3] # indices of the 3 vertices of the triangle where each point locates
+    Output:
+        transf_mtx: [batch, npoints, 3, 3], transformation matrix for points on the uv surface
+    """
+    
+    B, V = vtransf.shape[:2]
+    _, N = indices.shape[:2]
+    
+    idx = indices.view(B, -1)  # [batch, 3*npoints]
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)  # [batch, 1]
+    repeat_shape = list(idx.shape) # [batch, 3]
+    repeat_shape[0] = 1  # [1, 3]
+    batch_indices = torch.arange(B, dtype=torch.long).view(view_shape).repeat(repeat_shape)
+    
+    # get transformation matrices
+    vtransf = vtransf.view(B, V, -1)
+    new_vtransf = vtransf[batch_indices, idx, :] # [batch, npoints*3, 3, 3]  
+    new_vtransf = new_vtransf.view(B, N, 3, 3, 3) # [batch, npoints, 3, 3]
+    
+    transf_mtxs = bary_coords[:, :, 0].view(B, N, 1, 1) * new_vtransf[:, :, 0, :, :] + \
+                 bary_coords[:, :, 1].view(B, N, 1, 1) * new_vtransf[:, :, 1, :, :] + \
+                 bary_coords[:, :, 2].view(B, N, 1, 1) * new_vtransf[:, :, 2, :, :]
+    
+    # get body verts
+    body_verts = body_verts[batch_indices, idx, :].view(B, N, 3, 3) # [batch, npoints, 3, 3]
+    body_verts = bary_coords[:, :, 0].view(B, N, 1) * body_verts[:, :, 0, :] + \
+                 bary_coords[:, :, 1].view(B, N, 1) * body_verts[:, :, 1, :] + \
+                 bary_coords[:, :, 2].view(B, N, 1) * body_verts[:, :, 2, :]
+    
+    # pcd = o3d.geometry.PointCloud(
+    #     o3d.utility.Vector3dVector(body_verts[0].cpu().numpy())
+    # )
+    # o3d.io.write_point_cloud("/home/cindy/16825/project/SkiRT/results/test.ply", pcd)
+    
+    return transf_mtxs.double(), body_verts.double()
 
 
 class SampleSquarePoints():

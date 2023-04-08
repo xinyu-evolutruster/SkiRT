@@ -1,7 +1,7 @@
 import torch
 
 from lib.losses import normal_loss, chamfer_loss_separate
-from lib.utils_model import gen_transf_mtx_from_vtransf
+from lib.utils_model import gen_transf_mtx_from_vtransf, get_transf_mtx_from_vtransf
 
 
 def train(
@@ -126,3 +126,96 @@ def train(
 
     return train_m2s, train_s2m, train_lnormal, train_rgl, train_latent_rgl, train_total
 
+
+def train_coarse(
+    model, train_loader, optimizer, 
+    shape_featmap,
+    device='cuda',
+    loss_weights=None,
+):
+    n_train_samples = len(train_loader.dataset)  
+
+    train_m2s, train_s2m, train_lnormal, train_rgl, train_total = 0.0, 0.0, 0.0, 0.0, 0.0
+    # w_s2m, w_m2s, w_normal, w_rgl = loss_weights
+    w_s2m, w_m2s, w_normal, w_rgl = 1e4, 1e4, 1.0, 2e3
+
+    model.train()
+    for step, data in enumerate(train_loader):
+        
+        optimizer.zero_grad()
+        
+        # self.smpl_sampled_points, self.indices, self.barycentric_coords, \
+            # body_verts, scan_pc, scan_n, vtransf, index
+        [query_points, indices, bary_coords, body_verts, target_pc, target_pc_n, vtransf, index] = data
+        query_points, indices, bary_coords, vtransf = query_points.to(device), indices.to(device), bary_coords.to(device), vtransf.to(device)
+        body_verts, target_pc, target_pc_n = body_verts.to(device), target_pc.to(device), target_pc_n.to(device)
+        
+        # now we only train on a single garment so there is no need for indexing
+        query_shape_code = shape_featmap.to(device)
+
+        # batch size
+        bs = query_points.shape[0]
+        pred_residuals, pred_normals = model(query_points, query_shape_code)
+
+        # transf_mtx_map, body_verts = get_transf_mtx_from_vtransf(vtransf, body_verts, bary_coords, indices)
+        # print("transf_mtx_map shape: ", transf_mtx_map.shape) # [B, num_points, 3, 3]
+        
+        # map the predicted points to the global coordinate system
+        pred_residuals = pred_residuals.unsqueeze(-1)
+        pred_normals = pred_normals.unsqueeze(-1)
+
+        pred_residuals = torch.matmul(vtransf, pred_residuals).squeeze(-1)
+        pred_normals = torch.matmul(vtransf, pred_normals).squeeze(-1)
+        pred_normals = torch.nn.functional.normalize(pred_normals, dim=-1)
+
+        # --------------------------------
+        # ------------ losses ------------
+        
+        # chamfer loss
+        # Chamfer dist from the (s)can to (m)odel: from the GT points to its closest ponit in the predicted point set
+        full_pred = (body_verts + pred_residuals).float()
+        
+        m2s, s2m, idx_closest_gt, _ = chamfer_loss_separate(full_pred, target_pc) #idx1: [#pred points]
+        s2m = torch.mean(s2m)
+        
+        # normal loss
+        lnormal, closest_target_normals = normal_loss(pred_normals, target_pc_n, idx_closest_gt)
+        
+        # dist from the predicted points to their respective closest point on the GT, projected by
+        # the normal of these GT points, to appxoimate the point-to-surface distance
+        nearest_idx = idx_closest_gt.expand(3, -1, -1).permute([1,2,0]).long() # [batch, N] --> [batch, N, 3], repeat for the last dim
+        target_points_chosen = torch.gather(target_pc, dim=1, index=nearest_idx)
+        pc_diff = target_points_chosen - full_pred # vectors from prediction to its closest point in gt pcl
+        m2s = torch.sum(pc_diff * closest_target_normals, dim=-1) # project on direction of the normal of these gt points
+        m2s = torch.mean(m2s**2) # the length (squared) is the approx. pred point to scan surface dist.
+
+        # regularization loss
+        rgl_loss = torch.mean(pred_residuals ** 2)
+
+        loss = s2m * w_s2m + m2s * w_m2s + lnormal * w_normal + rgl_loss * w_rgl
+
+        loss.backward()
+        optimizer.step()
+        
+        # accumulate stats
+        train_m2s += m2s * bs
+        train_s2m += s2m * bs
+        train_lnormal += lnormal * bs
+        train_rgl += rgl_loss * bs
+        train_total += loss * bs
+        
+        print("step: {}, loss: {:.6f}, s2m: {:.6f}, m2s: {:.6f}, lnormal: {:.6f}, rgl: {:.6f}".format(
+            step, loss, s2m, m2s, lnormal, rgl_loss
+        ))
+        
+    train_m2s /= n_train_samples
+    train_s2m /= n_train_samples
+    train_lnormal /= n_train_samples
+    train_rgl /= n_train_samples
+    train_total /= n_train_samples
+    
+    return full_pred, body_verts, pred_normals, train_m2s, train_s2m, train_lnormal, train_rgl, train_total
+    
+
+def train_fine():
+    pass

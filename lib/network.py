@@ -110,3 +110,105 @@ class POP(nn.Module):
         normals = normals.view(B, 3, H, W, N_subsample)
         
         return residuals, normals
+
+
+class SkiRTCoarseNetwork(nn.Module):
+    def __init__(
+        self,
+        input_nc=3,    # num channels of the input point
+        input_sc=256,  # num channels of the shape code
+        num_layers=5,   # num of the MLP layers
+        num_layers_loc=3, # num of the MLP layers for the location prediction
+        num_layers_norm=3, # num of the MLP layers for the normal prediction
+        hsize=256,     # hidden layer size of the MLP
+        skip_layer=[4],  # skip layers
+        actv_fn='softplus',  # activation function
+        pos_encoding=False   # whether use Positional Encoding for the query point
+    ):
+        super().__init__()
+        
+        self.skip_layers = skip_layer
+        
+        self.actv_fn = None
+        if actv_fn == 'relu':
+            self.actv_fn = nn.ReLU()
+        elif actv_fn == 'leaky_relu':
+            self.actv_fn = nn.LeakyReLU()
+        else:
+            self.actv_fn = nn.Softplus()
+        
+        self.conv1 = nn.Conv1d(in_channels=input_nc+input_sc, out_channels=hsize, kernel_size=1)
+        self.conv2 = nn.Conv1d(in_channels=hsize, out_channels=hsize, kernel_size=1)
+        self.conv3 = nn.Conv1d(in_channels=hsize, out_channels=hsize, kernel_size=1)
+        self.conv4 = nn.Conv1d(in_channels=hsize+input_nc+input_sc, out_channels=hsize, kernel_size=1)
+        self.conv5 = nn.Conv1d(in_channels=hsize, out_channels=hsize, kernel_size=1)
+        
+        self.bn1 = nn.BatchNorm1d(hsize)
+        self.bn2 = nn.BatchNorm1d(hsize)
+        self.bn3 = nn.BatchNorm1d(hsize)
+        self.bn4 = nn.BatchNorm1d(hsize)
+        self.bn5 = nn.BatchNorm1d(hsize)
+        
+        # point locations prediction branch
+        self.point_loc_layers = []
+        for layer in range(num_layers_loc-1):
+            self.point_loc_layers.append(nn.Conv1d(
+                in_channels=hsize, out_channels=hsize, kernel_size=1))
+            self.point_loc_layers.append(nn.BatchNorm1d(hsize))
+            self.point_loc_layers.append(self.actv_fn)
+        self.point_loc_layers.append(nn.Conv1d(in_channels=hsize, out_channels=3, kernel_size=1))
+        
+        # point normals prediction branch
+        self.point_norm_layers = []
+        for layer in range(num_layers_norm-1):
+            self.point_norm_layers.append(nn.Conv1d(
+                in_channels=hsize, out_channels=hsize, kernel_size=1))
+            self.point_norm_layers.append(nn.BatchNorm1d(hsize))
+            self.point_norm_layers.append(self.actv_fn)
+        self.point_norm_layers.append(nn.Conv1d(in_channels=hsize, out_channels=3, kernel_size=1))
+        
+        self.point_loc_layers = nn.Sequential(*self.point_loc_layers)
+        self.point_norm_layers = nn.Sequential(*self.point_norm_layers)
+        
+    
+    def forward(self, point_coord, shape_code):
+        """
+        Input:
+            point_coord: the Cartesian coordinates of a query point 
+            from the surface of the SMPL-X model. 
+            - shape: [B, N, 3]
+            shape_code: the global shape code of the SMPL-X model shared 
+            by every query locations.
+            - shape: [1, 256]
+        Output:
+            point_locations: the predicted 3D locations of the query points.
+            point_normals: the predicted 3D normals of the query points.
+        """
+        
+        B, N = point_coord.shape[:2]
+        
+        shape_code = shape_code.unsqueeze(-1).repeat(B, 1, point_coord.shape[1]) # [B, 256, N]
+        point_coord = point_coord.transpose(1, 2) # [B, 3, N]
+        
+        input_feat = torch.cat([point_coord, shape_code], 1) # [B, 259, N]
+        # input_feat = point_coord
+        
+        out_feat = self.actv_fn(self.bn1(self.conv1(input_feat)))
+        out_feat = self.actv_fn(self.bn2(self.conv2(out_feat)))
+        out_feat = self.actv_fn(self.bn3(self.conv3(out_feat)))
+        out_feat = torch.cat([out_feat, input_feat], 1)
+        out_feat = self.actv_fn(self.bn4(self.conv4(out_feat)))
+        out_feat = self.actv_fn(self.bn5(self.conv5(out_feat)))
+    
+        pred_residuals = self.point_loc_layers(out_feat).permute(0, 2, 1)  # [B, N, 3]
+        pred_normals = self.point_norm_layers(out_feat).permute(0, 2, 1)   # [B, N, 3]
+        
+        return pred_residuals, pred_normals
+
+    
+class SkiRTFineNetwork(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self):
+        pass
