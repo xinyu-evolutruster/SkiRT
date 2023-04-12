@@ -1,5 +1,7 @@
 import torch
 import torch.nn.functional as F
+import pytorch3d
+import pytorch3d.ops
 
 def chamfer_loss_separate(output, target, weight=1e4, phase='train', debug=False):
     from chamferdist.chamferdist import ChamferDistance
@@ -29,6 +31,29 @@ def normal_loss(output_normals, target_normals, nearest_idx, weight=1.0, phase='
         lnormal = F.l1_loss(output_normals, target_normals_chosen, reduction='none')
         lnormal = lnormal.mean(-1).mean(-1) # avg over all but batch axis
         return lnormal, target_normals_chosen
+
+
+def repulsion_loss(pred_points, h=0.3, K=10, phase='train'):
+    dists, _, _ = pytorch3d.ops.knn_points(
+        pred_points, 
+        pred_points, 
+        K=K, 
+        return_nn=True
+    )
+    
+    dists = dists[:, :, 1:]
+    eta_dists = -1 * dists
+    
+    omega_dists = torch.exp(-dists * dists / (h ** 2))
+    density = eta_dists * omega_dists
+    density = density.mean(-1).mean(-1).mean(-1)
+
+    return density
+
+
+def uniform_loss(pred_points):
+    
+    pass
 
 
 def color_loss(output_colors, target_colors, nearest_idx, weight=1.0, phase='train', excl_holes=False):

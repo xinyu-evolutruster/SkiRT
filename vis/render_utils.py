@@ -1,7 +1,7 @@
 import torch
 import pytorch3d
 
-from utils import get_device, get_mesh_renderer, get_points_renderer
+from vis.utils import get_device, get_mesh_renderer, get_points_renderer
 
 
 def render_turntable_mesh(

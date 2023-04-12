@@ -18,9 +18,9 @@ import numpy as np
 import open3d as o3d
 
 from lib.config_parser import parse_config, parse_outfits
-from lib.dataset import CloDataSet, SKiRTCoarseDataset
-from lib.network import POP, SkiRTCoarseNetwork
-from lib.train import train, train_coarse
+from lib.dataset import SKiRTCoarseDataset
+from lib.network import POP, SkiRTCoarseNetwork, SkiRTFineNetwork
+from lib.train import train, train_coarse, train_fine
 from lib.infer import test_seen_clo, test_unseen_clo
 from lib.utils_io import load_masks, load_barycentric_coords, save_model, save_latent_feats, load_latent_feats
 from lib.utils_io import customized_export_ply, vertex_normal_2_vertex_color
@@ -354,6 +354,10 @@ def main_SkiRT():
 
     body_model = 'smpl' if args.dataset_type.lower() == 'cape' else 'smplx'
 
+    # geometric feature tensor
+    geom_featmap = torch.ones(1, 256).normal_(mean=0., std=0.01).cuda()
+    geom_featmap.requires_grad = True
+
     # build_model
     model = SkiRTCoarseNetwork(
         input_nc=3,    # num channels of the input point
@@ -364,19 +368,34 @@ def main_SkiRT():
         hsize=256,     # hidden layer size of the MLP
         skip_layer=[4],  # skip layers
         actv_fn='softplus',  # activation function
-        pos_encoding=False  
+        pos_encoding=True
     )
+    if args.load_checkpoint == True:
+        # load model weights
+        model_path = os.path.join(ckpt_dir, 'model_latest.pth')
+        print("loading model from checkpoint {}...".format(model_path))
+        model.load_state_dict(torch.load(model_path))
+        # load geometry feature map
+        geom_featmap_path = os.path.join(ckpt_dir, 'geom_featmap_latest.pth')
+        geom_featmap = torch.load(geom_featmap_path)
+        geom_featmap.requires_grad = True
+    
     model = model.cuda()
     # model = model.double().cuda()
     print(model)
     
-    # geometric feature tensor
-    geom_featmap = torch.ones(1, 256).normal_(mean=0., std=0.01).cuda()
-    geom_featmap.requires_grad = True
+    fine_model = SkiRTFineNetwork()
+    fine_model = fine_model.cuda()
+    print(fine_model)
+    
+    # local geometric feature tensor
+    N = 40000
+    local_geom_featmap = torch.ones(N, 64).normal_(mean=0., std=0.01).cuda()
+    local_geom_featmap.requires_grad = True
     
     # geometric feature tensor: local feature for every point
-    geom_featmap = torch.ones(10475, 256).normal_(mean=0., std=0.01).cuda()
-    geom_featmap.requires_grad = True
+    # geom_featmap = torch.ones(10475, 256).normal_(mean=0., std=0.01).cuda()
+    # geom_featmap.requires_grad = True
     
     optimizer = torch.optim.Adam(
         [
@@ -392,12 +411,10 @@ def main_SkiRT():
             dataset_subset_portion=1.0,
             sample_spacing = 1,
             outfits={'rp_felice_posed_004'},
-            smpl_face_path='./assets/smplx_faces.npy',
-            smpl_model_path='./assets/smplx/SMPLX_NEUTRAL.pkl',
+            smpl_model_path='./assets/smplx/smplx_model.obj',
             split='train', 
-            num_samples=20000,
-            knn=3,
-            body_model='smplx'
+            num_samples=30000,
+            body_model='smplx',
         )
 
         train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2)
@@ -411,23 +428,21 @@ def main_SkiRT():
         start = time.time()
         pbar = range(epoch_now, n_epochs)
 
+        writer = SummaryWriter(log_dir=log_dir)
+
         for epoch_idx in pbar:
             wdecay_rgl = adjust_loss_weights(args.w_rgl, epoch_idx, mode='decay', start=args.decay_start, every=args.decay_every)
             wrise_normal = adjust_loss_weights(args.w_normal, epoch_idx,  mode='rise', start=args.rise_start, every=args.rise_every)
             loss_weights = torch.tensor([args.w_s2m, args.w_m2s, wrise_normal, wdecay_rgl, args.w_latent_rgl])
 
             train_stats = train_coarse(
-                model, train_loader, optimizer, shape_featmap=geom_featmap,
+                epoch_idx, model, train_loader, optimizer, shape_featmap=geom_featmap,
             )
             
             full_pred = train_stats[0]
             # body_verts = train_stats[1]
             normals = train_stats[2]
-            # pcd = o3d.geometry.PointCloud(
-            #     o3d.utility.Vector3dVector(full_pred[0].cpu().detach().numpy()),
-            #     o3d.utility.Vector3dVector(normals[0].cpu().detach().numpy())
-            # )
-            # o3d.io.write_point_cloud('./results/pred_pcd_{}.ply'.format(epoch_idx), pcd)
+            
             if epoch_idx % 10 == 0:
                 customized_export_ply(
                     './results/pred_pcd_{}.ply'.format(epoch_idx),
@@ -435,10 +450,113 @@ def main_SkiRT():
                     v_n=normals[0].cpu().detach().numpy(), 
                     v_c=vertex_normal_2_vertex_color(normals[0].cpu().detach().numpy()),                          
                 )
+            
+            if epoch_idx % args.save_every == 0:
+                pth = os.path.join(ckpt_dir, 'model_{}.pth'.format(epoch_idx))
+                latest_pth = os.path.join(ckpt_dir, 'model_latest.pth')
+                
+                # save model
+                torch.save(model.state_dict(), pth)
+                torch.save(model.state_dict(), latest_pth)
+
+                # save geometry feature map
+                torch.save(geom_featmap, os.path.join(ckpt_dir, 'geom_featmap_{}.pth'.format(epoch_idx)))
+                torch.save(geom_featmap, os.path.join(ckpt_dir, 'geom_featmap_latest.pth'))
+
+            # train_m2s, train_s2m, train_lnormal, train_rgl, train_total
+            tensorboard_tabs = ['model2scan', 'scan2model', 'normal_loss', 'residual_square', 'total_loss']
+            stats = {'train': train_stats[3:]}
+
+            for split in ['train']:
+                for (tab, stat) in zip(tensorboard_tabs, stats[split]):
+                    writer.add_scalar('{}/{}'.format(tab, split), stat, epoch_idx)
+
+            print("Epoch: {}, time: {}".format(epoch_idx, time.time() - start))
 
         end = time.time()
         t_total = (end - start) / 60
         print("Training finished, duration: {:.2f} minutes. Now eval on test set..\n".format(t_total))
+
+    if args.mode.lower() == 'train_fine':
+
+        train_set = SKiRTCoarseDataset(
+            dataset_type='resynth',
+            data_root=data_root, 
+            dataset_subset_portion=1.0,
+            sample_spacing = 1,
+            outfits={'rp_felice_posed_004'},
+            smpl_model_path='./assets/smplx/smplx_model.obj',
+            split='train', 
+            num_samples=40000,
+            body_model='smplx',
+        )
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2)
+        
+        print("Total: {} training examples. Training started..".format(len(train_set)))
+
+        n_epochs = args.epochs
+        epoch_now = 0
+
+        model.to(DEVICE)
+        start = time.time()
+        pbar = range(epoch_now, n_epochs)
+
+        writer = SummaryWriter(log_dir=log_dir)
+
+        # load coarse checkpoint and fix the weights
+        ckpt_path = os.path.join(ckpt_dir, 'model_latest.pth')
+        model.load_state_dict(torch.load(ckpt_path))
+        model.eval()
+
+        for epoch_idx in pbar:
+            wdecay_rgl = adjust_loss_weights(args.w_rgl, epoch_idx, mode='decay', start=args.decay_start, every=args.decay_every)
+            wrise_normal = adjust_loss_weights(args.w_normal, epoch_idx,  mode='rise', start=args.rise_start, every=args.rise_every)
+            loss_weights = torch.tensor([args.w_s2m, args.w_m2s, wrise_normal, wdecay_rgl, args.w_latent_rgl])
+
+            train_stats = train_fine(
+                epoch_idx, 
+                model, fine_model, 
+                train_loader, optimizer,
+                geom_featmap, local_geom_featmap, 
+                loss_weights, device='cuda', )
+            
+            full_pred = train_stats[0]
+            # body_verts = train_stats[1]
+            normals = train_stats[2]
+            
+            if epoch_idx % 10 == 0:
+                customized_export_ply(
+                    './results/pred_pcd_{}.ply'.format(epoch_idx),
+                    v=full_pred[0].cpu().detach().numpy(),
+                    v_n=normals[0].cpu().detach().numpy(), 
+                    v_c=vertex_normal_2_vertex_color(normals[0].cpu().detach().numpy()),                          
+                )
+            
+            if epoch_idx % args.save_every == 0:
+                pth = os.path.join(ckpt_dir, 'model_{}.pth'.format(epoch_idx))
+                latest_pth = os.path.join(ckpt_dir, 'model_latest.pth')
+                
+                # save model
+                torch.save(model.state_dict(), pth)
+                torch.save(model.state_dict(), latest_pth)
+
+                # save geometry feature map
+                torch.save(geom_featmap, os.path.join(ckpt_dir, 'geom_featmap.pth'))
+
+            # train_m2s, train_s2m, train_lnormal, train_rgl, train_total
+            tensorboard_tabs = ['model2scan', 'scan2model', 'normal_loss', 'residual_square', 'total_loss']
+            stats = {'train': train_stats[3:]}
+
+            for split in ['train']:
+                for (tab, stat) in zip(tensorboard_tabs, stats[split]):
+                    writer.add_scalar('{}/{}'.format(tab, split), stat, epoch_idx)
+
+            print("Epoch: {}, time: {}".format(epoch_idx, time.time() - start))
+
+        end = time.time()
+        t_total = (end - start) / 60
+        print("Training finished, duration: {:.2f} minutes. Now eval on test set..\n".format(t_total))
+
 
 
 if __name__ == '__main__':

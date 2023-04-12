@@ -10,14 +10,13 @@ import argparse
 import pickle
 
 import matplotlib.pyplot as plt
-import mcubes
 import numpy as np
 import pytorch3d
 import torch
 import imageio
 
-from starter.utils import get_device, get_mesh_renderer, get_points_renderer
-from starter.render_utils import render_turntable_pcl, render_turntable_mesh
+from vis.utils import get_device, get_mesh_renderer, get_points_renderer
+from vis.render_utils import render_turntable_pcl, render_turntable_mesh
 
 
 def load_rgbd_data(path="data/rgbd_data.pkl"):
@@ -26,10 +25,12 @@ def load_rgbd_data(path="data/rgbd_data.pkl"):
     return data
 
 
-def render_bridge(
-    point_cloud_path="data/bridge_pointcloud.npz",
+def render_point_cloud(
+    verts, rgb,
     image_size=256,
     background_color=(1, 1, 1),
+    point_radius=0.01,
+    camera_dist=2,
     device=None,
 ):
     """
@@ -37,14 +38,14 @@ def render_bridge(
     """
     if device is None:
         device = get_device()
+        
     renderer = get_points_renderer(
-        image_size=image_size, background_color=background_color
+        image_size=image_size, background_color=background_color, radius=point_radius
     )
-    point_cloud = np.load(point_cloud_path)
-    verts = torch.Tensor(point_cloud["verts"][::50]).to(device).unsqueeze(0)
-    rgb = torch.Tensor(point_cloud["rgb"][::50]).to(device).unsqueeze(0)
+    # verts = torch.Tensor(point_cloud["verts"][::50]).to(device).unsqueeze(0)
+    # rgb = torch.Tensor(point_cloud["rgb"][::50]).to(device).unsqueeze(0)
     point_cloud = pytorch3d.structures.Pointclouds(points=verts, features=rgb)
-    R, T = pytorch3d.renderer.look_at_view_transform(4, 10, 0)
+    R, T = pytorch3d.renderer.look_at_view_transform(dist=camera_dist, elev=0, azim=0, degrees=True)
     cameras = pytorch3d.renderer.FoVPerspectiveCameras(R=R, T=T, device=device)
     rend = renderer(point_cloud, cameras=cameras)
     rend = rend.cpu().numpy()[0, ..., :3]  # (B, H, W, 4) -> (H, W, 3)

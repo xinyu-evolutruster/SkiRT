@@ -1,9 +1,14 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import trimesh
 import open3d as o3d
+
+import pytorch3d.ops.sample_farthest_points as sample_farthest_points
+import pytorch3d.ops.ball_query as ball_query
 
 def gen_transf_mtx_full_uv(verts, faces):
     '''
@@ -96,12 +101,7 @@ def get_transf_mtx_from_vtransf(vtransf, body_verts, bary_coords, indices):
     body_verts = bary_coords[:, :, 0].view(B, N, 1) * body_verts[:, :, 0, :] + \
                  bary_coords[:, :, 1].view(B, N, 1) * body_verts[:, :, 1, :] + \
                  bary_coords[:, :, 2].view(B, N, 1) * body_verts[:, :, 2, :]
-    
-    # pcd = o3d.geometry.PointCloud(
-    #     o3d.utility.Vector3dVector(body_verts[0].cpu().numpy())
-    # )
-    # o3d.io.write_point_cloud("/home/cindy/16825/project/SkiRT/results/test.ply", pcd)
-    
+
     return transf_mtxs.double(), body_verts.double()
 
 
@@ -246,3 +246,139 @@ def uv_to_grid(uv_idx_map, resolution):
     grid = uv_idx_map.reshape(bs, resolution, resolution, 2) * 2 - 1.
     grid = grid.transpose(1,2)
     return grid
+
+
+def sample_points(mesh, n_points):
+    samples, face_index = trimesh.sample.sample_surface_even(mesh, n_points)
+
+    # sample points in each triangle
+    # ref: https://math.stackexchange.com/questions/18686/uniform-random-point-in-triangle-in-3d
+    bary_coords = []
+    face_indices = []
+    for i, face in enumerate(face_index):
+        v0, v1, v2 = mesh.faces[face]
+        p0, p1, p2 = mesh.vertices[v0], mesh.vertices[v1], mesh.vertices[v2]
+        p = samples[i]
+        face_indices.append([v0, v1, v2])
+        
+        A = np.array([[p0[0], p1[0], p2[0]], [p0[1], p1[1], p2[1]], [1, 1, 1]])
+        b = np.array([p[0], p[1], 1])
+        u, v, w = np.linalg.solve(A, b)
+        bary_coords.append([u, v, w])
+    
+    face_indices = np.array(face_indices)
+    bary_coords = np.array(bary_coords)
+    
+    return samples, face_indices, bary_coords
+
+
+def pc_normalize(pc):
+    l = pc.shape[0]
+    centroid = np.mean(pc, axis=0)
+    pc -= centroid
+    m = np.max(np.sqrt(np.sum(pc ** 2, axis=1)))
+    pc = pc / m
+
+    return pc
+
+
+def square_distance(src, dst):
+    """
+    Calculate Euclid distance between each two points
+    src^T * dst = xn * xm + yn * ym + zn * zm;
+    sum(src^2, dim=-1) = xn*xn + yn*yn + zn*zn;
+    sum(dst^2, dim=-1) = xm*xm + ym*ym + zm*zm;
+    dist = (xn - xm)^2 + (yn - ym)^2 + (zn - zm)^2
+         = sum(src**2,dim=-1)+sum(dst**2,dim=-1)-2*src^T*dst
+    Input:
+        src: source points, [B, N, C]
+        dst: target points, [B, M, C]
+    Output:
+        dist: per-point square distance, [B, N, M]
+    """
+    B, N, _ = src.shape
+    _, M, _ = dst.shape
+    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))
+    dist += torch.sum(src ** 2, -1).view(B, N, 1)
+    dist += torch.sum(dst ** 2, -1).view(B, 1, M)
+    return dist
+
+
+def index_points(points, idx):
+    """
+    Input:
+        points: input points data, [B, N, C]
+        idx: sample index data, [B, S]
+    Return:
+        new_points:, indexed points data, [B, S, C]
+    """
+    device = points.device 
+    B = points.shape[0]
+    
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)
+    repeat_shape = list(idx.shape)
+    repeat_shape[0] = 1
+    batch_indices = torch.arange(B, dtype=torch.long).to(device).view(view_shape).repeat(repeat_shape)
+    new_points = points[batch_indices, idx, :]
+    
+    return new_points
+
+
+def sample_and_group(npoints, radius, nsample, xyz, points):
+    """
+    Input:
+        npoint:
+        radius:
+        nsample:
+        xyz: input points position data, [B, N, 3]
+        points: input points data, [B, N, D]
+    Return:
+        new_xyz: sampled points position data, [B, npoint, nsample, 3]
+        new_points: sampled points data, [B, npoint, nsample, 3+D]
+    """
+    B, N, C = xyz.shape[:3]
+    S = npoints
+    
+    _, fps_idx = sample_farthest_points(xyz, K=S)  # [B, S]
+    new_xyz = index_points(xyz, fps_idx)  # [B, S, C]
+    
+    _, idx, grouped_xyz = ball_query(xyz, new_xyz, K=nsample, radius=radius)  # [B, S, nsample]
+    grouped_xyz_norm = grouped_xyz - new_xyz.view(B, S, 1, C)
+
+    if points is not None:
+        grouped_points = index_points(points, idx)  # [B, S, nsample, C]
+        new_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)  # [B, S, nsample, C+D]
+    else:
+        new_points = grouped_xyz_norm
+        
+    return new_xyz, new_points
+
+
+def sample_and_group_all(xyz, points):
+    """
+    Input:
+        xyz: input points position data, [B, N, 3]
+        points: input points data, [B, N, D]
+    Return:
+        new_xyz: sampled points position data, [B, 1, 3]
+        new_points: sampled points data, [B, 1, N, 3+D]
+    """
+    device = xyz.device
+    
+    B, N, C = xyz.shape[:3]
+    new_xyz = torch.zeros(B, 1, C).to(device)  # [B, 1, C]
+    grouped_xyz = xyz.view(B, 1, N, C)
+    if points is not None:
+        new_points = torch.cat([grouped_xyz, points.view(B, 1, N, -1)], dim=-1)  # [B, 1, N, C+D]
+    else:
+        new_points = grouped_xyz
+    
+    return new_xyz, new_points
+
+
+if __name__ == '__main__':
+    mesh_path = '../outputs/smplx_test.obj'
+    mesh = trimesh.exchange.load.load(mesh_path)
+    
+    sample_points(mesh, 20000)

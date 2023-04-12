@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from lib.utils_model import PositionalEncoding, normalize_uv, uv_to_grid
 from lib.modules import UnetNoCond5DS, UnetNoCond6DS, UnetNoCond7DS, GeomConvLayers, GaussianSmoothingLayers, GeomConvBottleneckLayers, ShapeDecoder
 
+from lib.utils_model import sample_and_group, sample_and_group_all, square_distance, index_points
+
 
 class POP(nn.Module):
     def __init__(
@@ -123,9 +125,19 @@ class SkiRTCoarseNetwork(nn.Module):
         hsize=256,     # hidden layer size of the MLP
         skip_layer=[4],  # skip layers
         actv_fn='softplus',  # activation function
-        pos_encoding=False   # whether use Positional Encoding for the query point
+        pos_encoding=False,   # whether use Positional Encoding for the query point
+        num_emb_freqs=4,  # number of frequencies for the positional encoding
     ):
         super().__init__()
+        
+        self.input_nc = input_nc
+        self.input_sc = input_sc
+        self.pos_encoding = pos_encoding
+        if self.pos_encoding:
+            self.embedder = PositionalEncoding(
+                input_dims=self.input_nc, num_freqs=num_emb_freqs)
+            self.embedder.create_embedding_fn()
+            self.input_nc = self.embedder.out_dim
         
         self.skip_layers = skip_layer
         
@@ -137,10 +149,10 @@ class SkiRTCoarseNetwork(nn.Module):
         else:
             self.actv_fn = nn.Softplus()
         
-        self.conv1 = nn.Conv1d(in_channels=input_nc+input_sc, out_channels=hsize, kernel_size=1)
+        self.conv1 = nn.Conv1d(in_channels=self.input_nc+self.input_sc, out_channels=hsize, kernel_size=1)
         self.conv2 = nn.Conv1d(in_channels=hsize, out_channels=hsize, kernel_size=1)
         self.conv3 = nn.Conv1d(in_channels=hsize, out_channels=hsize, kernel_size=1)
-        self.conv4 = nn.Conv1d(in_channels=hsize+input_nc+input_sc, out_channels=hsize, kernel_size=1)
+        self.conv4 = nn.Conv1d(in_channels=hsize+self.input_nc+self.input_sc, out_channels=hsize, kernel_size=1)
         self.conv5 = nn.Conv1d(in_channels=hsize, out_channels=hsize, kernel_size=1)
         
         self.bn1 = nn.BatchNorm1d(hsize)
@@ -186,12 +198,13 @@ class SkiRTCoarseNetwork(nn.Module):
         """
         
         B, N = point_coord.shape[:2]
+        if self.pos_encoding:
+            point_coord = self.embedder.embed(point_coord)
         
         shape_code = shape_code.unsqueeze(-1).repeat(B, 1, point_coord.shape[1]) # [B, 256, N]
         point_coord = point_coord.transpose(1, 2) # [B, 3, N]
         
         input_feat = torch.cat([point_coord, shape_code], 1) # [B, 259, N]
-        # input_feat = point_coord
         
         out_feat = self.actv_fn(self.bn1(self.conv1(input_feat)))
         out_feat = self.actv_fn(self.bn2(self.conv2(out_feat)))
@@ -205,10 +218,235 @@ class SkiRTCoarseNetwork(nn.Module):
         
         return pred_residuals, pred_normals
 
+
+class PointNetSetAbstraction(nn.Module):
+    def __init__(self, npoint, radius, nsample, in_channel, mlp=None, group_all=False):
+        super().__init__()
+        self.npoint = npoint
+        self.radius = radius
+        self.nsample = nsample
+        self.mlp_convs = nn.ModuleList()
+        self.mlp_bns = nn.ModuleList()
+        last_channel = in_channel
+        
+        for out_channel in mlp:
+            self.mlp_convs.append(nn.Conv2d(last_channel, out_channel, kernel_size=1))
+            self.mlp_bns.append(nn.BatchNorm2d(out_channel))
+            last_channel = out_channel
+        
+        self.group_all = group_all
+        
+    def forward(self, xyz, points):
+        """
+        Input:
+            xyz: input points position data, [B, C, N]
+            points: input points data, [B, D, N]
+        Return:
+            new_xyz: sampled points position data, [B, C, S]
+            new_points_concat: sample points feature data, [B, D', S]
+        """
+        xyz = xyz.permute(0, 2, 1)
+        
+        if points is not None:
+            points = points.permute(0, 2, 1)
+            
+        if self.group_all:
+            new_xyz, new_points = sample_and_group_all(xyz, points)
+        else:
+            new_xyz, new_points = sample_and_group(self.npoint, self.radius, self.nsample, xyz, points)
+        
+        new_points = new_points.permute(0, 3, 2, 1)
+        for i, conv in enumerate(self.mlp_convs):
+            bn = self.mlp_bns[i]
+            new_points = F.relu(bn(conv(new_points)))
+        
+        new_points = torch.max(new_points, dim=2)[0]
+        new_xyz = new_xyz.permute(0, 2, 1)
+        
+        return new_xyz, new_points
+
+
+class PointNetFeaturePropagation(nn.Module):
+    def __init__(self, in_channel, mlp):
+        super().__init__()
+        
+        self.mlp_convs = nn.ModuleList()
+        self.mlp_bns = nn.ModuleList()
+        
+        last_channel = in_channel
+        for out_channel in mlp:
+            self.mlp_convs.append(nn.Conv1d(last_channel, out_channel, kernel_size=1))
+            self.mlp_bns.append(nn.BatchNorm1d(out_channel))
+            last_channel = out_channel
+        
+    def forward(self, xyz1, xyz2, points1, points2):
+        """
+        Input:
+            xyz1: input points position data, [B, C, N]
+            xyz2: sampled input points position data, [B, C, S]
+            points1: input points data, [B, D, N]
+            points2: input points data, [B, D, S]
+        Return:
+            new_points: upsampled points data, [B, D', N]
+        """
+        xyz1 = xyz1.permute(0, 2, 1)
+        xyz2 = xyz2.permute(0, 2, 1)
+        
+        points2 = points2.permute(0, 2, 1)
+        B, N, C = xyz1.shape
+        _, S, _ = xyz2.shape
+        
+        if S == 1:
+            interpolated_points = points2.repeat(1, N, 1)
+        else:
+            dists = square_distance(xyz1, xyz2)
+            dists, idx = dists.sort(dim=-1)
+            dists, idx = dists[:, :, :3], idx[:, :, :3]
+            
+            dist_recip = 1.0 / (dists + 1e-8)
+            norm = torch.sum(dist_recip, dim=2, keepdim=True)
+            weight = dist_recip / norm
+            interpolated_points = torch.sum(index_points(points2, idx) * weight.view(B, N, 3, 1), dim=2)
+            
+        if points1 is not None:
+            points1 = points1.permute(0, 2, 1)
+            new_points = torch.cat([points1, interpolated_points], dim=1)
+        else:
+            new_points = interpolated_points
+        
+        for i, conv in enumerate(self.mlp_convs):
+            bn = self.mlp_bns[i]
+            new_points = F.relu(bn(conv(new_points)))
+        
+        return new_points
+
+
+class PoseEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        self.sa1 = PointNetSetAbstraction(npoint=512, radius=0.2, nsample=32, in_channel=3, mlp=[32, 32, 64], group_all=False)
+        self.sa2 = PointNetSetAbstraction(npoint=128, radius=0.4, nsample=32, in_channel=64, mlp=[64, 64, 128], group_all=False)
+        self.sa3 = PointNetSetAbstraction(npoint=None, radius=None, nsample=None, in_channel=128, mlp=[128, 128, 256], group_all=True)
+        self.fp3 = PointNetFeaturePropagation(in_channel=384, mlp=[256, 256])
+        self.fp2 = PointNetFeaturePropagation(in_channel=320, mlp=[256, 256])
+        self.fp1 = PointNetFeaturePropagation(in_channel=320, mlp=[256, 128, 128, 128])
+        self.conv1 = nn.Conv1d(128, 128, kernel_size=1)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.drop1 = nn.Dropout(p=0.5)
+        self.conv2 = nn.Conv1d(128, 128, kernel_size=1)
+        
+    def forward(self, xyz, points):
+        
+        xyz = xyz.permute(0, 2, 1)  # [B, C, N]
+        
+        l0_points = xyz
+        l0_xyz = xyz[:, :3, :]
+        
+        l1_xyz, l1_points = self.sa1(l0_xyz, l0_points)
+        l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
+        l3_xyz, l3_points = self.sa3(l2_xyz, l2_points)
+        
+        l2_points = self.fp3(l2_xyz, l3_xyz, l2_points, l3_points)
+        l1_points = self.fp2(l1_xyz, l2_xyz, l1_points, l2_points)
+        l0_points = self.fp1(l0_xyz, l1_xyz, l0_points, l1_points)
+
+        feat = F.relu(self.bn1(self.conv1(l0_points)))
+        feat = self.drop1(feat)
+        feat = self.conv2(feat)
+        
+        return feat
+
+
+class GeometryEncoder(nn.Module):
+    def __init__(self, input_channel=64, hidden_size=128, output_channel=64):
+        super().__init__()
+        
+        self.layers = nn.Sequential(
+            nn.Conv1d(input_channel, hidden_size, kernel_size=1),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Conv1d(hidden_size, hidden_size, kernel_size=1),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Conv1d(hidden_size, output_channel, kernel_size=1),
+        )
+        
+    def forward(self, x):
+        feat = self.layers(x)
+        return feat
+
+
+class SkiRTShapeDecoder(nn.Module):
+    '''
+    The "Shape Decoder" in the POP paper Fig. 2. The same as the "shared MLP" in the SCALE paper.
+    - with skip connection from the input features to the 4th layer's output features (like DeepSDF)
+    - branches out at the second-to-last layer, one branch for position pred, one for normal pred
+    '''
+    def __init__(self, in_size, hsize = 256, actv_fn='softplus'):
+        self.hsize = hsize
+        super(SkiRTShapeDecoder, self).__init__()
+        self.conv1 = torch.nn.Conv1d(in_size, self.hsize, 1)
+        self.conv2 = torch.nn.Conv1d(self.hsize, self.hsize, 1)
+        self.conv3 = torch.nn.Conv1d(self.hsize, self.hsize, 1)
+        self.conv4 = torch.nn.Conv1d(self.hsize, self.hsize, 1)
+        self.conv5 = torch.nn.Conv1d(self.hsize+in_size, self.hsize, 1)
+        self.conv6 = torch.nn.Conv1d(self.hsize, self.hsize, 1)
+        self.conv7 = torch.nn.Conv1d(self.hsize, self.hsize, 1)
+        self.conv8 = torch.nn.Conv1d(self.hsize, 3, 1)
+
+        self.conv6N = torch.nn.Conv1d(self.hsize, self.hsize, 1)
+        self.conv7N = torch.nn.Conv1d(self.hsize, self.hsize, 1)
+        self.conv8N = torch.nn.Conv1d(self.hsize, 3, 1)
+
+        self.bn1 = torch.nn.BatchNorm1d(self.hsize)
+        self.bn2 = torch.nn.BatchNorm1d(self.hsize)
+        self.bn3 = torch.nn.BatchNorm1d(self.hsize)
+        self.bn4 = torch.nn.BatchNorm1d(self.hsize)
+
+        self.bn5 = torch.nn.BatchNorm1d(self.hsize)
+        self.bn6 = torch.nn.BatchNorm1d(self.hsize)
+        self.bn7 = torch.nn.BatchNorm1d(self.hsize)
+
+        self.bn6N = torch.nn.BatchNorm1d(self.hsize)
+        self.bn7N = torch.nn.BatchNorm1d(self.hsize)
+
+        self.actv_fn = nn.ReLU() if actv_fn=='relu' else nn.Softplus()
+
+    def forward(self, x):
+        x1 = self.actv_fn(self.bn1(self.conv1(x)))
+        x2 = self.actv_fn(self.bn2(self.conv2(x1)))
+        x3 = self.actv_fn(self.bn3(self.conv3(x2)))
+        x4 = self.actv_fn(self.bn4(self.conv4(x3)))
+        x5 = self.actv_fn(self.bn5(self.conv5(torch.cat([x,x4],dim=1))))
+
+        # position pred
+        x6 = self.actv_fn(self.bn6(self.conv6(x5)))
+        x7 = self.actv_fn(self.bn7(self.conv7(x6)))
+        x8 = self.conv8(x7)
+
+        # normals pred
+        xN6 = self.actv_fn(self.bn6N(self.conv6N(x5)))
+        xN7 = self.actv_fn(self.bn7N(self.conv7N(xN6)))
+        xN8 = self.conv8N(xN7)
+
+        return x8, xN8
+    
     
 class SkiRTFineNetwork(nn.Module):
     def __init__(self):
         super().__init__()
     
-    def forward(self):
-        pass
+        self.pose_feature_encoder = PoseEncoder()
+        self.geom_feature_encoder = GeometryEncoder()
+
+        self.decoder = SkiRTShapeDecoder(in_size=128)
+    
+    def forward(self, xyz, points, geom_feat):
+        
+        pose_feature = self.pose_feature_encoder(xyz, points)
+        geom_feature = self.geom_feature_encoder(geom_feat)
+        
+        residuals, normals = torch.cat([pose_feature, geom_feature], dim=1)
+        
+        return residuals, normals
