@@ -1,0 +1,13 @@
+name: SkiRT_fine_rp_christine_027
+coarse_name: SkiRT_coarse_rp_christine_027
+dataset_type: resynth
+mode: train_fine
+outfit: rp_christine_posed_027
+
+batch_size: 8
+lr: 3e-4
+lr_geomfeat: 5e-4
+
+epochs: 250
+save_every: 10
+# load_checkpoint: True

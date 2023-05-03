@@ -1,0 +1,11 @@
+name: SkiRT_fine_upsample_rp_beatrice_025
+coarse_name: SkiRT_coarse_rp_beatrice_025
+dataset_type: resynth
+mode: train_fine_upsample
+
+batch_size: 8
+lr: 3e-4
+lr_geomfeat: 5e-4
+
+epochs: 250
+save_every: 10

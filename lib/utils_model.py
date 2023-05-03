@@ -269,6 +269,8 @@ def sample_points(mesh, n_points):
     face_indices = np.array(face_indices)
     bary_coords = np.array(bary_coords)
     
+    samples = torch.from_numpy(samples).float()
+    
     return samples, face_indices, bary_coords
 
 
@@ -341,9 +343,13 @@ def sample_and_group(npoints, radius, nsample, xyz, points):
     S = npoints
     
     _, fps_idx = sample_farthest_points(xyz, K=S)  # [B, S]
+    
     new_xyz = index_points(xyz, fps_idx)  # [B, S, C]
     
-    _, idx, grouped_xyz = ball_query(xyz, new_xyz, K=nsample, radius=radius)  # [B, S, nsample]
+    new_xyz, xyz = new_xyz.float(), xyz.float()
+    
+    _, idx, grouped_xyz = ball_query(new_xyz, xyz, K=nsample, radius=radius)  # [B, S, nsample]
+    
     grouped_xyz_norm = grouped_xyz - new_xyz.view(B, S, 1, C)
 
     if points is not None:

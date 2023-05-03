@@ -6,13 +6,17 @@ def parse_config(argv=None):
     parser = configargparse.ArgParser(formatter_class=arg_formatter,
                                       config_file_parser_class=cfg_parser,
                                       description=description,
-                                      prog='POP')
+                                      prog='SkiRT')
 
     # general settings                              
     parser.add_argument('--config', is_config_file=True, help='config file path')
     parser.add_argument('--name', type=str, default='debug', help='name of a model/experiment. this name will be used for saving checkpoints and will also appear in saved examples')
-    parser.add_argument('--mode', type=str, default='test', choices=['train', 'resume', 'test', 'test_seen', 'test_unseen'], help='train/resume training/test, \
+    parser.add_argument('--coarse_name', type=str, default='debug')
+    parser.add_argument('--mode', type=str, default='test', 
+                        choices=['train', 'train_fine', 'train_fine_upsample', 'resume', 'test', 'test_seen', 'test_unseen'], 
+                        help='train/resume training/test, \
                                   for test_seen will evaluate on seen outfits unseen poses; test_unseen will test on unseen outfits (specified in configs/clo_config.yaml')
+    parser.add_argument('--outfit', type=str, default='test')
 
     # architecture related
     parser.add_argument('--hsize', type=int, default=256, help='hideen layer size of the ShapeDecoder mlp')

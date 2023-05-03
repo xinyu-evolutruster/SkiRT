@@ -1,12 +1,13 @@
-name: SkiRT_coarse_rp_anna_001
+name: SkiRT_fine_rp_anna_001
 coarse_name: SkiRT_coarse_rp_anna_001
 dataset_type: resynth
-mode: train
+mode: train_fine
 outfit: rp_anna_posed_001
 
 batch_size: 8
 lr: 3e-4
 lr_geomfeat: 5e-4
 
-epochs: 150
+epochs: 250
 save_every: 10
+# load_checkpoint: True

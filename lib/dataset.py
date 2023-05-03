@@ -1,19 +1,24 @@
 import os
-from os.path import join, dirname
 import glob
-import torch
-from torch.utils.data import Dataset
+import pickle
 import numpy as np
 from tqdm import tqdm
-import open3d as o3d
-import pickle
+from os.path import join, dirname
+
 import trimesh
+import open3d as o3d
 from scipy.spatial import KDTree
+from pytorch3d.ops import ball_query, knn_points
+
+import torch
+from torch.utils.data import Dataset
 
 from lib.utils_model import sample_points
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
+# fix the random seed
+torch.manual_seed(7)
 
 class SKiRTCoarseDataset(Dataset):
     def __init__(
@@ -24,6 +29,7 @@ class SKiRTCoarseDataset(Dataset):
         sample_spacing = 1,
         outfits={},
         smpl_model_path=None,
+        smpl_faces_path=None,
         split='train', 
         num_samples=20000,
         body_model='smplx'):
@@ -36,18 +42,34 @@ class SKiRTCoarseDataset(Dataset):
         # will be sth like "./data/packed/cape/00032_shortlong/train"
         self.data_dirs = {outfit: join(data_root, outfit, split) for outfit in outfits} 
         
+        print("self.data_dirs: ", self.data_dirs)
+        
         # randomly subsample a number of data from each clothing type (using all data from all outfits will be too much)
         self.dataset_subset_portion = dataset_subset_portion 
         
         # import smplx model
         self.smpl_sampled_points = None
-        self.faces, self.vertices = None, None
+        self.smpl_faces = None
         if body_model == 'smplx':
-            mesh = trimesh.exchange.load.load(smpl_model_path)
-            self.smpl_sampled_points, self.indices, self.bary_coords = sample_points(mesh, num_samples)
+            # load vertices
+            smpl_info = np.load(smpl_model_path, allow_pickle=True)
+            smpl_info = dict(smpl_info)
+            self.smpl_sampled_points = torch.from_numpy(smpl_info['v_template'])
+            # load faces
+            self.smpl_faces = np.load(smpl_faces_path, allow_pickle=True)
         else:
             raise NotImplementedError('Only support SMPLX model for now.')
 
+        # sample some random points
+        self.random_sampled_points, self.rand_associated_indices = self.sample_random_points(
+            smpl_sampled_points=self.smpl_sampled_points,
+            smpl_faces=self.smpl_faces,
+            threshold=0.15, num_samples=40000
+        )
+
+        self.num_smpl_points = self.smpl_sampled_points.shape[0]
+        self.num_rand_points = self.random_sampled_points.shape[0]
+        
         # load the data. Train with only one garment template first.
         flist_all = []
         subj_id_all = []
@@ -83,20 +105,122 @@ class SKiRTCoarseDataset(Dataset):
                 vtransf = vtransf[:, :3, :3]
             self.vtransf.append(vtransf)
     
+    def sample_random_points(self, smpl_sampled_points, smpl_faces, threshold=0.15, num_samples=20000):
+        # load mesh and convert to open3d geometry
+        mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(smpl_sampled_points),
+            o3d.utility.Vector3iVector(smpl_faces)
+        )
+        mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+        scene = o3d.t.geometry.RaycastingScene()
+        _ = scene.add_triangles(mesh)
+        
+        xmin, ymin, zmin = torch.min(self.smpl_sampled_points, axis=0)[0]
+        xmax, ymax, zmax = torch.max(self.smpl_sampled_points, axis=0)[0]
+        zmin = zmin - threshold
+        zmax = zmax + threshold
+        
+        num_xpoints, num_ypoints, num_zpoints = int((xmax-xmin)*30), int((ymax-ymin)*30), int((zmax-zmin)*30)
+        num_points = num_xpoints * num_ypoints * num_zpoints
+        
+        x = np.linspace(xmin, xmax, num_xpoints, endpoint=False) + 1/(2*num_xpoints)
+        y = np.linspace(ymin, ymax, num_ypoints, endpoint=False) + 1/(2*num_ypoints)
+        z = np.linspace(zmin, zmax, num_zpoints, endpoint=False) + 1/(2*num_zpoints)
+        X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+        cell_centers = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+        
+        query_points = o3d.core.Tensor(cell_centers, dtype=o3d.core.Dtype.Float32)
+        
+        # calculate the sdf of mesh
+        distances = scene.compute_signed_distance(query_points)
+        distances = np.asarray(distances)
+        
+        valid_points = cell_centers[distances<threshold]
+        distances = distances[distances<threshold]
+        valid_points = torch.tensor(valid_points[distances>0]).float()
+        
+        print("ymin = {}, ymax = {}".format(ymin, ymax))
+        
+        mask = valid_points[:, 1] <= -0.2
+        valid_points = valid_points[mask]
+        mask = valid_points[:, 1] >= -0.7
+        valid_points = valid_points[mask]
+
+        distances, indices, _ = knn_points(
+            valid_points.unsqueeze(dim=0), 
+            self.smpl_sampled_points.unsqueeze(dim=0),
+            K=40, return_nn=False
+        )
+        rand_associated_indices = indices.squeeze(dim=0)
+
+        # find averaged points
+        view_shape = list(indices.shape)
+        view_shape[1:] = [1] * (len(view_shape) - 1)
+        repeat_shape = list(indices.shape)
+        repeat_shape[0] = 1
+        batch_indices = torch.arange(1, dtype=torch.long).view(view_shape).repeat(repeat_shape)
+        smpl_points = self.smpl_sampled_points.unsqueeze(dim=0)
+        averaged_points = smpl_points[batch_indices, indices, :]
+        averaged_points = torch.mean(averaged_points, dim=2)
+
+        # find the nearest points on the mesh
+        # if the distance is below a certain threshold: the point is too close to the body,
+        # thus we discard it as the body mesh itself will suffice to model the clothes.
+        distances, _, _ = knn_points(
+            averaged_points, 
+            smpl_points,
+            K=1, return_nn=False
+        )
+        # print(distances.max())
+        thresh = 8e-4
+        
+        mask = (distances.squeeze(dim=0) > thresh)
+        cell_centers = valid_points[mask.repeat(1,3)].view(-1, 3)
+        
+        num_valid_points = cell_centers.shape[0]
+        rand_points = np.zeros((num_valid_points*10, 3))        
+        side_len = 2.2
+        for j in range(10):    
+            for i in range(num_valid_points):
+                x, y, z = cell_centers[i]
+                rand_points[j*num_valid_points+i] = np.random.uniform(
+                    [x-side_len/(2*num_xpoints), y-side_len/(2*num_ypoints), z-side_len/(2*num_zpoints)], 
+                    [x+side_len/(2*num_xpoints), y+side_len/(2*num_ypoints), z+side_len/(2*num_zpoints)]
+                )
+        
+        rand_points = torch.tensor(rand_points).float()
+        
+        distances, indices, _ = knn_points(
+            rand_points.unsqueeze(dim=0), 
+            self.smpl_sampled_points.unsqueeze(dim=0),
+            K=40, return_nn=False
+        )
+        rand_associated_indices = indices.squeeze(dim=0)
+        
+        # find averaged points
+        view_shape = list(indices.shape)
+        view_shape[1:] = [1] * (len(view_shape) - 1)
+        repeat_shape = list(indices.shape)
+        repeat_shape[0] = 1
+        batch_indices = torch.arange(1, dtype=torch.long).view(view_shape).repeat(repeat_shape)
+        smpl_points = self.smpl_sampled_points.unsqueeze(dim=0)
+        averaged_points = smpl_points[batch_indices, indices, :]
+        averaged_points = torch.mean(averaged_points, dim=2)
+        random_sampled_points = averaged_points.squeeze(dim=0)
+
+        print("random_sampled_points.shape: ", random_sampled_points.shape)
+
+        return random_sampled_points, rand_associated_indices
+    
     def __getitem__(self, index):
         body_verts = self.body_verts[index]
         scan_n = self.scan_n[index]
         scan_pc = self.scan_pc[index]
-
         vtransf = self.vtransf[index]
-
-        # if self.scan_npoints != -1: 
-        #     selected_idx = torch.randperm(len(scan_n))[:self.scan_npoints]
-        #     scan_pc = scan_pc[selected_idx, :]
-        #     scan_n = scan_n[selected_idx, :]
-
-        return self.smpl_sampled_points, self.indices, self.bary_coords, \
-            body_verts, scan_pc, scan_n, vtransf, index
+        
+        query_points = torch.cat((self.smpl_sampled_points, self.random_sampled_points), dim=0)
+        
+        return query_points, self.rand_associated_indices, body_verts, scan_pc, scan_n, vtransf, index
     
     def __len__(self):
         return len(self.scan_n)
@@ -113,7 +237,7 @@ class SKiRTFineDataset(Dataset):
         smpl_model_path=None,
         smpl_face_path=None,
         split='train', 
-        num_samples=20000,
+        num_samples=40000,
         body_model='smplx'):
         
         self.dataset_type = dataset_type
@@ -128,17 +252,32 @@ class SKiRTFineDataset(Dataset):
         # randomly subsample a number of data from each clothing type (using all data from all outfits will be too much)
         self.dataset_subset_portion = dataset_subset_portion 
         
-        # load smpl faces
-        self.faces = np.load(smpl_face_path, allow_pickle=True)
-        
         # import smplx model
         self.smpl_sampled_points = None
-        self.faces, self.vertices = None, None
+        self.smpl_vertices, self.smpl_faces = None, None
         if body_model == 'smplx':
-            mesh = trimesh.exchange.load.load(smpl_model_path)
-            self.smpl_sampled_points, self.indices, self.bary_coords = sample_points(mesh, num_samples)
+            # load vertices
+            smpl_info = np.load(smpl_model_path, allow_pickle=True)
+            smpl_info = dict(smpl_info)
+            self.smpl_vertices = torch.from_numpy(smpl_info['v_template'])
+            # load faces
+            self.smpl_faces = np.load(smpl_face_path, allow_pickle=True)
+            # create a trimesh mesh
+            mesh = trimesh.Trimesh(vertices=self.smpl_vertices, faces=self.smpl_faces)
+            self.smpl_sampled_points, self.indices, self.bary_coords = sample_points(mesh, n_points=num_samples)
+            # print("type of self.smpl_sampled_points: ", type(self.smpl_sampled_points))
         else:
             raise NotImplementedError('Only support SMPLX model for now.')
+        
+        # sample some random points
+        self.random_sampled_points, self.rand_associated_indices = self.sample_random_points(
+            smpl_sampled_points=self.smpl_vertices,
+            smpl_faces=self.smpl_faces,
+            threshold=0.15, num_samples=40000
+        )
+
+        self.num_smpl_points = self.smpl_sampled_points.shape[0]
+        self.num_rand_points = self.random_sampled_points.shape[0]
         
         # load the data. Train with only one garment template first.
         flist_all = []
@@ -175,6 +314,113 @@ class SKiRTFineDataset(Dataset):
                 vtransf = vtransf[:, :3, :3]
             self.vtransf.append(vtransf)
     
+    def sample_random_points(self, smpl_sampled_points, smpl_faces, threshold=0.15, num_samples=20000):
+        # load mesh and convert to open3d geometry
+        mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(smpl_sampled_points),
+            o3d.utility.Vector3iVector(smpl_faces)
+        )
+        mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+        scene = o3d.t.geometry.RaycastingScene()
+        _ = scene.add_triangles(mesh)
+        
+        xmin, ymin, zmin = torch.min(self.smpl_vertices, axis=0)[0]
+        xmax, ymax, zmax = torch.max(self.smpl_vertices, axis=0)[0]
+        zmin = zmin - threshold
+        zmax = zmax + threshold
+        
+        num_xpoints, num_ypoints, num_zpoints = int((xmax-xmin)*30), int((ymax-ymin)*30), int((zmax-zmin)*30)
+        num_points = num_xpoints * num_ypoints * num_zpoints
+        
+        x = np.linspace(xmin, xmax, num_xpoints, endpoint=False) + 1/(2*num_xpoints)
+        y = np.linspace(ymin, ymax, num_ypoints, endpoint=False) + 1/(2*num_ypoints)
+        z = np.linspace(zmin, zmax, num_zpoints, endpoint=False) + 1/(2*num_zpoints)
+        X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+        cell_centers = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+        
+        query_points = o3d.core.Tensor(cell_centers, dtype=o3d.core.Dtype.Float32)
+        
+        # calculate the sdf of mesh
+        distances = scene.compute_signed_distance(query_points)
+        distances = np.asarray(distances)
+        
+        valid_points = cell_centers[distances<threshold]
+        distances = distances[distances<threshold]
+        valid_points = torch.tensor(valid_points[distances>0]).float()
+        
+        print("ymin = {}, ymax = {}".format(ymin, ymax))
+        
+        mask = valid_points[:, 1] <= -0.2
+        valid_points = valid_points[mask]
+        mask = valid_points[:, 1] >= -0.7
+        valid_points = valid_points[mask]
+
+        distances, indices, _ = knn_points(
+            valid_points.unsqueeze(dim=0), 
+            self.smpl_vertices.unsqueeze(dim=0),
+            K=40, return_nn=False
+        )
+        rand_associated_indices = indices.squeeze(dim=0)
+
+        # find averaged points
+        view_shape = list(indices.shape)
+        view_shape[1:] = [1] * (len(view_shape) - 1)
+        repeat_shape = list(indices.shape)
+        repeat_shape[0] = 1
+        batch_indices = torch.arange(1, dtype=torch.long).view(view_shape).repeat(repeat_shape)
+        smpl_points = self.smpl_vertices.unsqueeze(dim=0)
+        averaged_points = smpl_points[batch_indices, indices, :]
+        averaged_points = torch.mean(averaged_points, dim=2)
+
+        # find the nearest points on the mesh
+        # if the distance is below a certain threshold: the point is too close to the body,
+        # thus we discard it as the body mesh itself will suffice to model the clothes.
+        distances, _, _ = knn_points(
+            averaged_points, 
+            smpl_points,
+            K=1, return_nn=False
+        )
+        # print(distances.max())
+        thresh = 8e-4
+        
+        mask = (distances.squeeze(dim=0) > thresh)
+        cell_centers = valid_points[mask.repeat(1,3)].view(-1, 3)
+        
+        num_valid_points = cell_centers.shape[0]
+        rand_points = np.zeros((num_valid_points*50, 3))        
+        side_len = 2.5
+        for j in range(10):    
+            for i in range(num_valid_points):
+                x, y, z = cell_centers[i]
+                rand_points[j*num_valid_points+i] = np.random.uniform(
+                    [x-side_len/(2*num_xpoints), y-side_len/(2*num_ypoints), z-side_len/(2*num_zpoints)], 
+                    [x+side_len/(2*num_xpoints), y+side_len/(2*num_ypoints), z+side_len/(2*num_zpoints)]
+                )
+        
+        rand_points = torch.tensor(rand_points).float()
+        
+        distances, indices, _ = knn_points(
+            rand_points.unsqueeze(dim=0), 
+            self.smpl_vertices.unsqueeze(dim=0),
+            K=40, return_nn=False
+        )
+        rand_associated_indices = indices.squeeze(dim=0)
+        
+        # find averaged points
+        view_shape = list(indices.shape)
+        view_shape[1:] = [1] * (len(view_shape) - 1)
+        repeat_shape = list(indices.shape)
+        repeat_shape[0] = 1
+        batch_indices = torch.arange(1, dtype=torch.long).view(view_shape).repeat(repeat_shape)
+        smpl_points = self.smpl_vertices.unsqueeze(dim=0)
+        averaged_points = smpl_points[batch_indices, indices, :]
+        averaged_points = torch.mean(averaged_points, dim=2)
+        random_sampled_points = averaged_points.squeeze(dim=0)
+
+        print("random_sampled_points.shape: ", random_sampled_points.shape)
+
+        return random_sampled_points, rand_associated_indices
+    
     def __getitem__(self, index):
         """
         Every time we sample a new random point cloud from the SMPL body.
@@ -182,14 +428,12 @@ class SKiRTFineDataset(Dataset):
         body_verts = self.body_verts[index]
         scan_n = self.scan_n[index]
         scan_pc = self.scan_pc[index]
-
         vtransf = self.vtransf[index]
 
-        # mesh = trimesh.Trimesh(body_verts, self.faces, process=False)
-        # smpl_sampled_points, indices, bary_coords = sample_points(mesh, self.num_samples)
-
-        return self.smpl_sampled_points, self.indices, self.bary_coords, \
-            body_verts, scan_pc, scan_n, vtransf, index
+        query_points = torch.cat((self.smpl_sampled_points, self.random_sampled_points), dim=0)
+        
+        return query_points, self.indices, self.rand_associated_indices, \
+            self.bary_coords, body_verts, scan_pc, scan_n, vtransf, index
     
     def __len__(self):
         return len(self.scan_n)
@@ -209,7 +453,11 @@ def test_smpl():
     # 'shapedirs', 'dynamic_lmk_bary_coords', 'ft', 'hands_componentsl', 
     # 'joint2num', 'v_template', 'allow_pickle', 'f', 'hands_coeffsl', 
     # 'kintree_table', 'weights']
-    # print(list(smpl_model.keys()))
+    print(list(smpl_info.keys()))
+    J_regressor = smpl_info['J_regressor']
+    print("J_regressor shape: ", J_regressor.shape)
+    weights = smpl_info['weights']
+    print("weights shape: ", weights.shape)
     
     smpl_model_path = '../data/resynth/packed/rp_anna_posed_001/train/rp_anna_posed_001.96_jerseyshort_ATUsquat.00020.npz'
     # smpl_model = pickle.load(open(smpl_model_path, 'rb'), encoding='latin1')
@@ -217,11 +465,11 @@ def test_smpl():
     smpl_model = dict(smpl_model)
     vertices = smpl_model['body_verts']
     
-    target_pc = smpl_model['scan_pc']
-    pcd = o3d.geometry.PointCloud(
-        o3d.utility.Vector3dVector(target_pc)
-    )
-    o3d.io.write_point_cloud('smplx_anna.ply', pcd)
+    # target_pc = smpl_model['scan_pc']
+    # pcd = o3d.geometry.PointCloud(
+    #     o3d.utility.Vector3dVector(target_pc)
+    # )
+    # o3d.io.write_point_cloud('smplx_anna.ply', pcd)
     
     # vertices = smpl_model['v_template']
     # weights = smpl_model['weights']
@@ -231,13 +479,13 @@ def test_smpl():
     # print(posedirs.shape)  # (10475, 55)
     
     # print(vertices.shape)
-    mesh = o3d.geometry.TriangleMesh(
-        o3d.utility.Vector3dVector(vertices),
-        o3d.utility.Vector3iVector(faces)
-    )
+    # mesh = o3d.geometry.TriangleMesh(
+    #     o3d.utility.Vector3dVector(vertices),
+    #     o3d.utility.Vector3iVector(faces)
+    # )
     
     # o3d.visualization.draw_geometries([mesh])
-    o3d.io.write_triangle_mesh('smplx_test.obj', mesh)
+    # o3d.io.write_triangle_mesh('smplx_test.obj', mesh)
     
     # pcd = mesh.sample_points_uniformly(number_of_points=20000)
     # o3d.io.write_point_cloud('smplx_test_20000.ply', pcd)
@@ -247,7 +495,7 @@ def test_smpl():
 def test_resynth_data():
     import os
     
-    data_dir = '../data/packed'
+    data_dir = '../data/resynth/packed'
     human = 'rp_aaron_posed_002'
     split = 'train'
     test_file = 'rp_aaron_posed_002.96_jerseyshort_ATUsquat.00172.npz'
@@ -256,7 +504,7 @@ def test_resynth_data():
     
     model = dict(np.load(file_path, allow_pickle=True))
     
-    # print(list(model.keys()))
+    print(list(model.keys()))
     body_verts = model['body_verts']
     scan_pc = model['scan_pc']
     scan_n = model['scan_n']
@@ -268,10 +516,10 @@ def test_resynth_data():
     
     # print(vtransf.shape)    # (10475, 3, 3)
     
-    pcd = o3d.geometry.PointCloud(
-        o3d.utility.Vector3dVector(body_verts)
-    )
-    o3d.io.write_point_cloud('body_verts.ply', pcd)
+    # pcd = o3d.geometry.PointCloud(
+    #     o3d.utility.Vector3dVector(body_verts)
+    # )
+    # o3d.io.write_point_cloud('body_verts.ply', pcd)
 
 
 def test_scipy_kdtree():
@@ -301,11 +549,120 @@ def test_scipy_kdtree():
         print()
 
 
-def test_scan_pcl():
+def test_random_sampling():
+    from utils_io import customized_export_ply
+    path = '../assets/smplx/SMPLX_NEUTRAL.npz'
+    smpl_face_path = '../assets/smplx_faces.npy'
     
-    data_path = '../data/resynth/scans/rp_felice_posed_004/'
+    # load mesh and convert to open3d geometry
+    smpl_info = np.load(path, allow_pickle=True)
+    smpl_info = dict(smpl_info)
     
-    pass
+    smpl_sampled_points = smpl_info['v_template']
+    faces = np.load(smpl_face_path, allow_pickle=True)
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(smpl_sampled_points),
+        o3d.utility.Vector3iVector(faces)
+    )
+    
+    mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    scene = o3d.t.geometry.RaycastingScene()
+    _ = scene.add_triangles(mesh)
+    
+    num_samples = 20000
+    
+    xmin, ymin, zmin = np.min(smpl_sampled_points, axis=0)
+    xmax, ymax, zmax = np.max(smpl_sampled_points, axis=0)
+        
+    points = np.random.rand(num_samples, 3)
+    x = (points[:, 0] - points[:, 0].min()) / (points[:, 0].max() - points[:, 0].min())
+    y = (points[:, 1] - points[:, 1].min()) / (points[:, 1].max() - points[:, 1].min())
+    z = (points[:, 2] - points[:, 2].min()) / (points[:, 2].max() - points[:, 2].min())
+    x = xmin + (xmax - xmin) * x
+    y = ymin + (ymax - ymin) * y
+    z = zmin + (zmax - zmin) * z
+    rand_points = np.stack([x, y, z], axis=1)
+    
+    query_points = o3d.core.Tensor(rand_points, dtype=o3d.core.Dtype.Float32)
+    
+    # calculate the sdf of mesh
+    distances = scene.compute_signed_distance(query_points)
+    distances = np.asarray(distances)
+    
+    threshold = 0.25
+    valid_points = rand_points[distances<threshold]
+    distances = distances[distances<threshold]
+    valid_points = valid_points[distances>0]
+    
+    mask = valid_points[:, 1] <= -0.5
+    valid_points = valid_points[mask]
+    
+    all_points = np.concatenate([smpl_sampled_points, valid_points], axis=0)
+    
+    red = np.array([255, 0, 0]).reshape(1, 3).repeat(10475, axis=0)
+    green = np.array([0, 255, 0]).reshape(1, 3).repeat(valid_points.shape[0], axis=0)
+    vc = np.concatenate([red, green], axis=0)
+    
+    valid_points = torch.from_numpy(valid_points).float()
+    smpl_sampled_points = torch.from_numpy(np.asarray(smpl_sampled_points)).float()
+    
+    customized_export_ply(
+        'query_points.ply',
+        v=all_points,
+        v_c=vc
+    )
+    
+    distances, indices, _ = knn_points(
+        valid_points.unsqueeze(dim=0), 
+        smpl_sampled_points.unsqueeze(dim=0),
+        K=40, return_nn=False
+    )
+    # weights = 1.0 / (distances + 1e-6)
+    # # normalize weights
+    # weights = weights / torch.sum(weights, dim=2, keepdim=True)
+    
+    B, _ = indices.shape[:2]
+    view_shape = list(indices.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)
+    repeat_shape = list(indices.shape)
+    repeat_shape[0] = 1
+    batch_indices = torch.arange(B, dtype=torch.long).view(view_shape).repeat(repeat_shape)
+    averaged_points = smpl_sampled_points.unsqueeze(dim=0).repeat(B, 1, 1)[batch_indices, indices, :]
+    averaged_points = torch.mean(averaged_points, dim=2)
+    
+    print("averaged_points: ", averaged_points.shape)
+    
+    customized_export_ply(
+        'smplx_sampled_points.ply',
+        v=averaged_points[0],
+    )   
+
+    # try body verts
+    # test_file = 'rp_aaron_posed_002.96_jerseyshort_tilt_twist_left.00064.npz'
+    test_file = 'rp_aaron_posed_002.96_jerseyshort_ATUsquat.00080.npz'
+    data_dir = '../data/resynth/packed'
+    human = 'rp_aaron_posed_002'
+    split = 'train'
+    file_path = os.path.join(data_dir, human, split, test_file)
+    
+    model = dict(np.load(file_path, allow_pickle=True))
+    body_verts = torch.from_numpy(model['body_verts'])
+
+    # mesh = o3d.geometry.TriangleMesh(
+    #     o3d.utility.Vector3dVector(body_verts),
+    #     o3d.utility.Vector3iVector(faces)
+    # )
+    # o3d.io.write_triangle_mesh('smplx_test.obj', mesh)
+    # mesh = o3d.io.read_triangle_mesh('smplx_test.obj')
+    # body_verts = torch.from_numpy(np.asarray(mesh.vertices)).float()
+    
+    posed_averaged_points = body_verts.unsqueeze(dim=0).repeat(B, 1, 1)[batch_indices, indices, :]
+    posed_averaged_points = torch.mean(posed_averaged_points, dim=2)
+    
+    customized_export_ply(
+        'posed_averaged_points.ply',
+        v=posed_averaged_points[0],
+    )  
 
 
 if __name__ == '__main__':
@@ -314,16 +671,18 @@ if __name__ == '__main__':
     # test_scipy_kdtree()
     
     # test SkiRT dataset
-    dataset = SKiRTCoarseDataset(
-        dataset_type='resynth',
-        data_root='../data/packed', 
-        dataset_subset_portion=1.0,
-        sample_spacing = 1,
-        outfits={'rp_aaron_posed_002'},
-        smpl_face_path='../assets/smplx_faces.npy',
-        smpl_model_path='../assets/smplx/SMPLX_NEUTRAL.pkl',
-        split='train', 
-        num_samples=20000,
-        knn=3,
-        body_model='smplx'
-    )
+    # dataset = SKiRTCoarseDataset(
+    #     dataset_type='resynth',
+    #     data_root='../data/packed', 
+    #     dataset_subset_portion=1.0,
+    #     sample_spacing = 1,
+    #     outfits={'rp_aaron_posed_002'},
+    #     smpl_face_path='../assets/smplx_faces.npy',
+    #     smpl_model_path='../assets/smplx/SMPLX_NEUTRAL.pkl',
+    #     split='train', 
+    #     num_samples=20000,
+    #     knn=3,
+    #     body_model='smplx'
+    # )
+    
+    test_random_sampling()

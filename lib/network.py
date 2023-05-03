@@ -3,115 +3,48 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lib.utils_model import PositionalEncoding, normalize_uv, uv_to_grid
-from lib.modules import UnetNoCond5DS, UnetNoCond6DS, UnetNoCond7DS, GeomConvLayers, GaussianSmoothingLayers, GeomConvBottleneckLayers, ShapeDecoder
-
 from lib.utils_model import sample_and_group, sample_and_group_all, square_distance, index_points
 
+from lib.modules import UnetNoCond5DS, UnetNoCond6DS, UnetNoCond7DS, GeomConvLayers, GaussianSmoothingLayers, GeomConvBottleneckLayers, ShapeDecoder
 
-class POP(nn.Module):
-    def __init__(
-                self, 
-                input_nc=3, # num channels of the unet input
-                c_geom=64, # channels of the geometric features
-                c_pose=64, # channels of the pose features
-                geom_layer_type='conv', # the type of architecture used for smoothing the geometric feature tensor
-                nf=64, # num filters for the unet
-                inp_posmap_size=128, # size of UV positional map (pose conditioning), i.e. the input to the pose unet
-                hsize=256, # hidden layer size of the ShapeDecoder MLP
-                up_mode='upconv', # upconv or upsample for the upsampling layers in the pose feature UNet
-                use_dropout=False, # whether use dropout in the pose feature UNet
-                pos_encoding=False, # whether use Positional Encoding for the query UV coordinates
-                num_emb_freqs=8, # number of sinusoida frequences if positional encoding is used
-                posemb_incl_input=False, # wheter include the original coordinate if using Positional Encoding
-                uv_feat_dim=2, # input dimension of the uv coordinates
-                pq_feat_dim = 2, # input dimension of the pq coordinates
-                gaussian_kernel_size = 3, #optional, if use gaussian smoothing for the geometric features
-                ):
+from faster_pointnet2.pointnet2.pointnet2_modules import PointnetSAModule, PointnetFPModule
 
-        super().__init__()
-        self.inp_posmap_size = inp_posmap_size
-        self.pos_encoding = pos_encoding
-        self.geom_layer_type = geom_layer_type 
+# fix the random seed
+torch.manual_seed(12345)
+
+class STN3d(nn.Module):
+    def __init__(self, in_channel):
+        super(STN3d, self).__init__()
         
-        geom_proc_layers = {
-            'unet': UnetNoCond5DS(c_geom, c_geom, nf, up_mode, use_dropout), # use a unet
-            'conv': GeomConvLayers(c_geom, c_geom, c_geom, use_relu=False), # use 3 trainable conv layers
-            'bottleneck': GeomConvBottleneckLayers(c_geom, c_geom, c_geom, use_relu=False), # use 3 trainable conv layers
-            'gaussian': GaussianSmoothingLayers(channels=c_geom, kernel_size=gaussian_kernel_size, sigma=1.0), # use a fixed gaussian smoother
-        }
-        unets = {32: UnetNoCond5DS, 64: UnetNoCond6DS, 128: UnetNoCond7DS, 256: UnetNoCond7DS}
-        unet_loaded = unets[self.inp_posmap_size]
+        self.conv1 = nn.Conv1d(in_channel, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, 1024, 1)
+        self.relu = nn.ReLU()
+        self.fc1 = nn.Conv1d(1024, 512, 1)
+        self.fc2 = nn.Conv1d(512, 256, 1)
+        self.fc3 = nn.Conv1d(256, 9, 1)
+        
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
 
-        if self.pos_encoding:
-            self.embedder = PositionalEncoding(num_freqs=num_emb_freqs,
-                                               input_dims=uv_feat_dim,
-                                               include_input=posemb_incl_input)
-            self.embedder.create_embedding_fn()
-            self.uv_feat_dim = self.embedder.out_dim
-
-        # U-net: for extracting pixel-aligned pose features from the input UV positional maps
-        self.unet_posefeat = unet_loaded(input_nc, c_pose, nf, up_mode=up_mode, use_dropout=use_dropout)
-
-        # optional layer for spatially smoothing the geometric feature tensor
-        if geom_layer_type is not None:
-            self.geom_proc_layers = geom_proc_layers[geom_layer_type]
+        
+    def forward(self, x):
+        batchsize = x.size()[0]
     
-        # shared shape decoder across different outfit types
-        self.decoder = ShapeDecoder(in_size=uv_feat_dim + pq_feat_dim + c_geom + c_pose,
-                                    hsize=hsize, actv_fn='softplus')
-
-            
-    def forward(self, x, geom_featmap, uv_loc, pq_coords):
-        '''
-        :param x: input posmap, [batch, 3, 256, 256]
-        :param geom_featmap: a [B, C, H, W] tensor, spatially pixel-aligned with the pose features extracted by the UNet
-        :param uv_loc: querying uv coordinates, ranging between 0 and 1, of shape [B, H*W, 2].
-        :param pq_coords: the 'sub-UV-pixel' (p,q) coordinates, range [0,1), shape [B, H*W, 1, 2]. 
-                        Note: It is the intra-patch coordinates in SCALE. Kept here for the backward compatibility with SCALE.
-        :return:
-            clothing offset vectors (residuals) and normals of the points
-        '''
-        # pose features
-        pose_featmap = self.unet_posefeat(x)
-
-        # geometric feature tensor
-        if self.geom_layer_type is not None:
-            geom_featmap = self.geom_proc_layers(geom_featmap)
-
-        # pose and geom features are concatenated to form the feature for each point
-        pix_feature = torch.cat([pose_featmap, geom_featmap], 1)
-
-        feat_res = geom_featmap.shape[2] # spatial resolution of the input pose and geometric features
-        uv_res = int(uv_loc.shape[1]**0.5) # spatial resolution of the query uv map
-
-        # spatially bilinearly upsample the features to match the query resolution
-        if feat_res != uv_res:
-            query_grid = uv_to_grid(uv_loc, uv_res)
-            pix_feature = F.grid_sample(pix_feature, query_grid, mode='bilinear', align_corners=False)#, align_corners=True)
-
-        B, C, H, W = pix_feature.shape
-        N_subsample = 1 # inherit the SCALE code custom, but now only sample one point per pixel
-
-        uv_feat_dim = uv_loc.size()[-1]
-        pq_coords = pq_coords.reshape(B, -1, 2).transpose(1, 2)  # [B, 2, Num all subpixels]
-        uv_loc = uv_loc.expand(N_subsample, -1, -1, -1).permute([1, 2, 0, 3])
-
-        # uv and pix feature is shared for all points in each patch
-        pix_feature = pix_feature.view(B, C, -1).expand(N_subsample, -1,-1,-1).permute([1,2,3,0]) # [B, C, N_pix, N_sample_perpix]
-        pix_feature = pix_feature.reshape(B, C, -1)
-
-        if self.pos_encoding:
-            uv_loc = normalize_uv(uv_loc).view(-1,uv_feat_dim)
-            uv_loc = self.embedder.embed(uv_loc).view(B, -1,self.embedder.out_dim).transpose(1,2)
-        else:
-            uv_loc = uv_loc.reshape(B, -1, uv_feat_dim).transpose(1, 2)  # [B, N_pix, N_subsample, 2] --> [B, 2, Num of all pq subpixels]
-
-        residuals, normals = self.decoder(torch.cat([pix_feature, uv_loc, pq_coords], 1))  # [B, 3, N all subpixels]
-
-        residuals = residuals.view(B, 3, H, W, N_subsample)
-        normals = normals.view(B, 3, H, W, N_subsample)
+        x = self.relu(self.bn1(self.conv1(x))) # [B, 64, N]
+        x = self.relu(self.bn2(self.conv2(x))) # [B, 128, N]
+        x = self.relu(self.bn3(self.conv3(x))) # [B, 1024, N]
+        x = self.relu(self.bn4(self.fc1(x)))   # [B, 512, N]
+        x = self.relu(self.bn5(self.fc2(x)))   # [B, 256, N]
+        x = self.fc3(x)                        # [B, 9, N]
+    
+        x = x.view(batchsize, 3, 3, -1) # [B, 3, 3, N]
+        x = x.permute(0, 3, 1, 2)        # [B, N, 3, 3]
         
-        return residuals, normals
+        return x
 
 
 class SkiRTCoarseNetwork(nn.Module):
@@ -182,7 +115,6 @@ class SkiRTCoarseNetwork(nn.Module):
         self.point_loc_layers = nn.Sequential(*self.point_loc_layers)
         self.point_norm_layers = nn.Sequential(*self.point_norm_layers)
         
-    
     def forward(self, point_coord, shape_code):
         """
         Input:
@@ -215,7 +147,7 @@ class SkiRTCoarseNetwork(nn.Module):
     
         pred_residuals = self.point_loc_layers(out_feat).permute(0, 2, 1)  # [B, N, 3]
         pred_normals = self.point_norm_layers(out_feat).permute(0, 2, 1)   # [B, N, 3]
-        
+            
         return pred_residuals, pred_normals
 
 
@@ -227,8 +159,8 @@ class PointNetSetAbstraction(nn.Module):
         self.nsample = nsample
         self.mlp_convs = nn.ModuleList()
         self.mlp_bns = nn.ModuleList()
-        last_channel = in_channel
         
+        last_channel = in_channel
         for out_channel in mlp:
             self.mlp_convs.append(nn.Conv2d(last_channel, out_channel, kernel_size=1))
             self.mlp_bns.append(nn.BatchNorm2d(out_channel))
@@ -255,14 +187,15 @@ class PointNetSetAbstraction(nn.Module):
         else:
             new_xyz, new_points = sample_and_group(self.npoint, self.radius, self.nsample, xyz, points)
         
-        new_points = new_points.permute(0, 3, 2, 1)
+        # [B, S, nsample, C+D]
+        new_points = new_points.permute(0, 3, 2, 1)  # [B, C+D, nsample, npoint]
         for i, conv in enumerate(self.mlp_convs):
             bn = self.mlp_bns[i]
             new_points = F.relu(bn(conv(new_points)))
         
         new_points = torch.max(new_points, dim=2)[0]
         new_xyz = new_xyz.permute(0, 2, 1)
-        
+ 
         return new_xyz, new_points
 
 
@@ -289,10 +222,10 @@ class PointNetFeaturePropagation(nn.Module):
         Return:
             new_points: upsampled points data, [B, D', N]
         """
-        xyz1 = xyz1.permute(0, 2, 1)
-        xyz2 = xyz2.permute(0, 2, 1)
+        xyz1 = xyz1.permute(0, 2, 1).float()  # [B, N, C]
+        xyz2 = xyz2.permute(0, 2, 1).float()  # [B, S, C]
         
-        points2 = points2.permute(0, 2, 1)
+        points2 = points2.permute(0, 2, 1)  # [B, S, D]
         B, N, C = xyz1.shape
         _, S, _ = xyz2.shape
         
@@ -307,13 +240,14 @@ class PointNetFeaturePropagation(nn.Module):
             norm = torch.sum(dist_recip, dim=2, keepdim=True)
             weight = dist_recip / norm
             interpolated_points = torch.sum(index_points(points2, idx) * weight.view(B, N, 3, 1), dim=2)
-            
+        
         if points1 is not None:
-            points1 = points1.permute(0, 2, 1)
-            new_points = torch.cat([points1, interpolated_points], dim=1)
+            points1 = points1.permute(0, 2, 1) # [B, N, D]            
+            new_points = torch.cat([points1, interpolated_points], dim=-1)
         else:
             new_points = interpolated_points
-        
+             
+        new_points = new_points.permute(0, 2, 1)
         for i, conv in enumerate(self.mlp_convs):
             bn = self.mlp_bns[i]
             new_points = F.relu(bn(conv(new_points)))
@@ -321,27 +255,154 @@ class PointNetFeaturePropagation(nn.Module):
         return new_points
 
 
+class Voxelization(nn.Module):
+    def __init__(self, resolution, normalize=True, eps=0):
+        super().__init__()
+        self.resolution = int(resolution)
+        self.normalize = normalize
+        self.eps = eps
+        
+    def forward(self, features, coords):
+        coords = coords.detach()
+        norm_coords = coords - coords.mean(2, keepdim=True)
+        if self.normalize:
+            norm_coords = norm_coords / (norm_coords.norm(2, dim=1, keepdim=True).max(dim=2, keepdim=True).values * 2.0 + self.eps) + 0.5
+        else:
+            norm_coords = (norm_coords + 1.0) / 2.0
+        
+        norm_coords = torch.clamp(norm_coords * self.resolution, 0, self.resolution - 1)
+        vox_coords = torch.round(norm_coords).to(torch.int32)
+        return F.avg_voxelize(features, vox_coords, self.resolution, self.resolution), norm_coords
+
+    def extra_repr(self):
+        return 'resolution={}{}'.format(self.resolution, ', normalize eps = {}'.format(self.eps) if self.normalize else '')
+
+
+class SE3d(nn.Module):
+    def __init__(self, channel, reduction=8):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, inputs):
+        return inputs * self.fc(inputs.mean((2, 3, 4), keepdim=True))
+
+
+class SharedMLP(nn.Module):
+    def __init__(self, in_channel, out_channels, dim=1):
+        super().__init__()
+        if dim == 1:
+            conv = nn.Conv1d
+            bn = nn.BatchNorm1d
+        elif dim == 2:
+            conv = nn.Conv2d
+            bn = nn.BatchNorm2d
+        else:
+            raise ValueError
+        
+        if not isinstance(out_channels, (list, tuple)):
+            out_channels = [out_channels]
+        layers = []
+        
+        for out_channel in out_channels:
+            layers.extend([
+                conv(in_channel, out_channel, 1),
+                bn(out_channel),
+                nn.ReLU(inplace=True)
+            ])
+            in_channel = out_channel
+        
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, inputs):
+        if isinstance(inputs, (list, tuple)):
+            return (self.layers(inputs[0]), *inputs[1:])
+        else:
+            return self.layers(inputs)
+
+
+class PVConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, resolution, with_se=False, normalize=True, eps=0):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.resolution = resolution
+
+        self.voxelization = Voxelization(resolution, normalize=normalize, eps=eps)
+        voxel_layers = [
+            nn.Conv3d(in_channels, out_channels, kernel_size, stride=1, padding=kernel_size//2),
+            nn.BatchNorm3d(out_channels, eps=1e-4),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Conv3d(out_channels, out_channels, kernel_size, stride=1, padding=kernel_size//2),
+            nn.BatchNorm3d(out_channels, eps=1e-4),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+        ]
+        if with_se:
+            voxel_layers.append(SE3d(out_channels))
+        self.voxel_layers = nn.Sequential(*voxel_layers)
+        self.point_features = SharedMLP(in_channels, out_channels)
+
+    def forward(self, inputs):
+        features, coords = inputs
+        
+        voxel_features, voxel_coords = self.voxelization(features, coords)
+        voxel_features = self.voxel_layers(voxel_features)
+        voxel_features = F.trilinear_devoxelize(voxel_features, voxel_coords, self.resolution, self.training)
+        fused_features = voxel_features + self.point_features(features)
+
+        return fused_features, coords
+
+
 class PoseEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channel=3):
         super().__init__()
         
-        self.sa1 = PointNetSetAbstraction(npoint=512, radius=0.2, nsample=32, in_channel=3, mlp=[32, 32, 64], group_all=False)
-        self.sa2 = PointNetSetAbstraction(npoint=128, radius=0.4, nsample=32, in_channel=64, mlp=[64, 64, 128], group_all=False)
-        self.sa3 = PointNetSetAbstraction(npoint=None, radius=None, nsample=None, in_channel=128, mlp=[128, 128, 256], group_all=True)
-        self.fp3 = PointNetFeaturePropagation(in_channel=384, mlp=[256, 256])
-        self.fp2 = PointNetFeaturePropagation(in_channel=320, mlp=[256, 256])
-        self.fp1 = PointNetFeaturePropagation(in_channel=320, mlp=[256, 128, 128, 128])
+        # self.sa1 = PointNetSetAbstraction(npoint=512, radius=0.1, nsample=16, in_channel=in_channel, mlp=[32, 32, 64], group_all=False)
+        # self.sa2 = PointNetSetAbstraction(npoint=128, radius=0.2, nsample=16, in_channel=64+3, mlp=[64, 64, 128], group_all=False)
+        # self.sa3 = PointNetSetAbstraction(npoint=None, radius=None, nsample=None, in_channel=128+3, mlp=[128, 128, 256], group_all=True)
+        # self.fp3 = PointNetFeaturePropagation(in_channel=256+128, mlp=[256, 256])
+        # self.fp2 = PointNetFeaturePropagation(in_channel=256+64, mlp=[256, 256])
+        # self.fp1 = PointNetFeaturePropagation(in_channel=256, mlp=[256, 128, 128, 128])
+        
+        self.sa1 = PointnetSAModule(
+            mlp=[0, 32, 32, 64], 
+            npoint=512, radius=0.1, nsample=16
+        )
+        self.sa2 = PointnetSAModule(
+            mlp=[64, 64, 128],
+            npoint=128, radius=0.2, nsample=16   
+        )
+        self.sa3 = PointnetSAModule(
+            mlp=[128, 128, 256],
+            npoint=None, radius=None, nsample=None
+        )
+        self.fp3 = PointnetFPModule(mlp=[384, 256, 256])
+        self.fp2 = PointnetFPModule(mlp=[320, 256, 256])
+        self.fp1 = PointnetFPModule(mlp=[256, 128, 128, 128])
+        
         self.conv1 = nn.Conv1d(128, 128, kernel_size=1)
         self.bn1 = nn.BatchNorm1d(128)
         self.drop1 = nn.Dropout(p=0.5)
-        self.conv2 = nn.Conv1d(128, 128, kernel_size=1)
+        self.conv2 = nn.Conv1d(128, 64, kernel_size=1)
         
     def forward(self, xyz, points):
         
-        xyz = xyz.permute(0, 2, 1)  # [B, C, N]
+        # xyz = xyz.permute(0, 2, 1)  # [B, C, N]
+        # if points is not None:
+        #     points = points.permute(0, 2, 1)  # [B, D, N]
         
-        l0_points = xyz
-        l0_xyz = xyz[:, :3, :]
+        l0_points = points  # coarse input
+        # l0_xyz = xyz[:, :3, :]
+        l0_xyz = xyz
+        
+        l0_xyz = l0_xyz.contiguous().float()
+        if l0_points is not None:
+            l0_points = l0_points.contiguous().float()
         
         l1_xyz, l1_points = self.sa1(l0_xyz, l0_points)
         l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
@@ -373,6 +434,8 @@ class GeometryEncoder(nn.Module):
         )
         
     def forward(self, x):
+        
+        x = x.permute(0, 2, 1)  # [B, C, N]
         feat = self.layers(x)
         return feat
 
@@ -383,7 +446,7 @@ class SkiRTShapeDecoder(nn.Module):
     - with skip connection from the input features to the 4th layer's output features (like DeepSDF)
     - branches out at the second-to-last layer, one branch for position pred, one for normal pred
     '''
-    def __init__(self, in_size, hsize = 256, actv_fn='softplus'):
+    def __init__(self, in_size=64+64, hsize=128, actv_fn='softplus'):
         self.hsize = hsize
         super(SkiRTShapeDecoder, self).__init__()
         self.conv1 = torch.nn.Conv1d(in_size, self.hsize, 1)
@@ -431,22 +494,123 @@ class SkiRTShapeDecoder(nn.Module):
         xN8 = self.conv8N(xN7)
 
         return x8, xN8
-    
+
     
 class SkiRTFineNetwork(nn.Module):
     def __init__(self):
         super().__init__()
-    
-        self.pose_feature_encoder = PoseEncoder()
+
+        self.pose_feature_encoder = PoseEncoder(in_channel=3)
         self.geom_feature_encoder = GeometryEncoder()
 
         self.decoder = SkiRTShapeDecoder(in_size=128)
     
     def forward(self, xyz, points, geom_feat):
         
-        pose_feature = self.pose_feature_encoder(xyz, points)
-        geom_feature = self.geom_feature_encoder(geom_feat)
+        B = xyz.shape[0]
+        N, C = geom_feat.shape
         
-        residuals, normals = torch.cat([pose_feature, geom_feature], dim=1)
+        pose_feature = self.pose_feature_encoder(xyz, points)
+        
+        geom_feat = geom_feat.view(1, N, C).repeat(B, 1, 1)
+        geom_feature = self.geom_feature_encoder(geom_feat)
+
+        feature = torch.cat([pose_feature, geom_feature], dim=1)
+        
+        residuals, normals = self.decoder(feature)
+        
+        residuals = residuals.permute(0, 2, 1)
+        normals = normals.permute(0, 2, 1)
+        
+        return residuals, normals
+   
+
+class FeatureExpansion(nn.Module):
+    def __init__(self, in_size, hidden_size=64, out_size=64, r=9):
+        super(FeatureExpansion, self).__init__()
+
+        self.num_replicate = r
+        self.expansions = nn.ModuleList()
+
+        for i in range(self.num_replicate):
+            mlp_convs = nn.ModuleList()
+            mlp_convs.append(nn.Conv1d(in_size, hidden_size, kernel_size=1))
+            mlp_convs.append(nn.BatchNorm1d(hidden_size))
+            mlp_convs.append(nn.Conv1d(hidden_size, hidden_size, kernel_size=1))
+            mlp_convs.append(nn.BatchNorm1d(hidden_size))
+            mlp_convs.append(nn.Conv1d(hidden_size, out_size, kernel_size=1))
+            
+            self.expansions.append(mlp_convs)
+
+    def forward(self, x):
+        output = None
+        for i in range(self.num_replicate):
+            mlp_convs = self.expansions[i]
+            conv0 = mlp_convs[0]
+            conv1 = mlp_convs[2]
+            conv2 = mlp_convs[4]
+            bn0 = mlp_convs[1]
+            bn1 = mlp_convs[3]
+            fea = F.relu(conv1(bn0(conv0(x))))
+            fea = F.relu(conv2(bn1(fea)))
+
+            if i == 0:
+                output = fea.unsqueeze(1)
+            else:
+                fea = fea.unsqueeze(1)
+                output = torch.cat([output, fea], dim=1)
+             
+        return output
+ 
+
+class SkiRTUpsampleNetwork(nn.Module):
+    def __init__(self, pose_feature_channel=64, geom_feature_channel=64, upsample_rate=4):
+        super().__init__()
+
+        self.pose_feature_channel=pose_feature_channel
+        self.geom_feature_channel=geom_feature_channel
+        self.upsample_rate = upsample_rate
+
+        self.pose_feature_encoder = PoseEncoder(in_channel=3)
+        self.geom_feature_encoder = GeometryEncoder()
+        
+        self.feature_expansion = FeatureExpansion(
+            in_size=64, hidden_size=128, out_size=64, r=self.upsample_rate
+        )
+
+        self.decoder = SkiRTShapeDecoder(in_size=128)
+
+    def forward(self, xyz, points, geom_feat, random_points):
+        
+        B, N = xyz.shape[0], xyz.shape[1]
+        N2, C = geom_feat.shape
+
+        xyz = torch.cat([xyz, random_points], dim=1)
+        pose_feature = self.pose_feature_encoder(xyz, points)
+        
+        random_pose_feature = pose_feature[:, :, N:] 
+        random_pose_feature = self.feature_expansion(random_pose_feature).permute([0, 1, 3, 2])
+        random_pose_feature = random_pose_feature.reshape(B, self.pose_feature_channel, -1)
+        
+        # pose_feature = pose_feature.reshape(B, -1, self.pose_feature_channel)
+        pose_feature = torch.cat([pose_feature[:, :, :N], random_pose_feature], dim=2).permute([0, 2, 1])
+        
+        geom_feat = geom_feat.view(1, N2, C).repeat(B, 1, 1)
+        geom_feature = self.geom_feature_encoder(geom_feat).permute(0, 2, 1)
+        
+        random_geom_feature = geom_feature[:, N:, :].unsqueeze(1).repeat(1, self.upsample_rate, 1, 1)
+        random_geom_feature = random_geom_feature.reshape(B, -1, self.geom_feature_channel)
+        
+        geom_feature = torch.cat([geom_feature[:, :N, :], random_geom_feature], dim=1)
+        
+        # geom_feature = geom_feature.unsqueeze(1).repeat(1, self.upsample_rate, 1, 1)
+        # geom_feature = geom_feature.reshape(B, -1, self.geom_feature_channel)
+
+        feature = torch.cat([pose_feature, geom_feature], dim=2).permute(0, 2, 1)
+        
+        residuals, normals = self.decoder(feature)
+        
+        residuals = residuals.permute(0, 2, 1)
+        normals = normals.permute(0, 2, 1)
         
         return residuals, normals
